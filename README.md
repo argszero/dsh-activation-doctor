@@ -51,9 +51,31 @@ its entries (`ctx.loader.entries()`), every entry carries its fiber, and
 
 ## Install
 
-```sh
-npm install @argszero/dsh-activation-doctor
+**In the application (the Desktop shell, and the Web UI).** Desktop's profile is
+the application's own and cannot be managed from a terminal: `dsh --profile
+desktop` and `dsh plugin --profile desktop …` are both refused before they run
+(`apps/cli/src/args.ts`, `rejectElectronProfile` — the `plugin` subcommand skips
+the refusal only for Desktop's own installed carrier). Install it where that
+profile *is* managed: open the sidebar's **Plugins** page, choose **Add plugin**,
+and give the package name.
+
 ```
+@argszero/dsh-activation-doctor
+```
+
+The Host reads the spec, installs it, and offers **Enable now**; the same page
+switches the plugin off later without uninstalling it (which is what keeps the
+report file readable after the incident).
+
+**In a profile the launcher manages (web, tui, any custom profile).**
+
+```sh
+dsh plugin --profile <name> add @argszero/dsh-activation-doctor
+```
+
+That command forwards to pnpm inside the profile directory, so `npm install
+@argszero/dsh-activation-doctor` run there is equivalent — a profile is an
+ordinary package with its own `package.json`.
 
 Then mount it, or apply the bundled patch, which mounts it and changes nothing
 else:
@@ -96,6 +118,13 @@ else:
   a non-blank value, and `~/.dsh` otherwise — the same directory the harness's own
   startup report uses. The first line warns that raw diagnostics may contain
   configuration or credential values.
+
+  **Before pasting a report into a public thread, read its header.** It records
+  `timestamp`, `phase`, `settled`, `dshVersion`, `profile`, `nodeVersion`,
+  `platform` and `execPath` — the last three name the machine and the exact Node
+  binary, which is more about you than about the bug. The entries below the header
+  quote a failing plugin's own error text verbatim, and that text is whatever the
+  plugin chose to say, so it may carry a path or a value from your configuration.
 - **Prints one line** per finding, plus the report path, to stderr — the same
   channel the harness already uses for third-party activation failures.
 - **Keeps watching.** A failure that appears later — a hot reload, a profile patch

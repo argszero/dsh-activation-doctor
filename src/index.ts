@@ -212,21 +212,21 @@ function statusTool(
 /**
  * Mount the doctor.
  *
- * Both mount spellings are supported: `ctx.plugin(moduleNamespace)` has Cordis
- * fill the exported `Config` defaults, while `ctx.plugin({ name, inject, apply })`
- * passes `undefined` — so the defaults live here as well as in the schema.
+ * `config` is whatever a loader entry passed, or `undefined` when it passed
+ * nothing, so the defaults live here. They cannot live in an exported `Config`:
+ * cordis reads `Config['~standard'].validate` off a plugin's `Config`
+ * (measured: `vendor/cordis/src/fiber.ts`, `resolveConfig`), and a plain defaults
+ * object has no such property, so naming one there throws
+ * `Cannot read properties of undefined (reading 'validate')` out of
+ * `Fiber._reload` — before this function is called, taking the doctor down
+ * exactly when somebody needs it to report on the plugin that just did the same.
  *
- * There is deliberately **no `Config` export**. Cordis validates a plugin's
- * config through `runtime.Config['~standard'].validate(config)` whenever the
- * runtime carries a `Config` at all (measured: `vendor/cordis/src/fiber.ts`,
- * `resolveConfig`), and a plain default object has no `~standard` — exporting
- * `Config: defaultConfig` therefore throws `Cannot read properties of undefined
- * (reading 'validate')` out of `Fiber._reload`, taking this plugin down before it
- * can report on anybody. A schema would be the other way to satisfy that check,
- * at the price of a `@deepseek-ai/schemastery` peer; every knob here is read
- * defensively by {@link normalizeConfig} instead, so the defaults are the same
- * object with or without a schema, and one fewer dependency is one fewer range
- * to keep admitted across the release lines.
+ * There is deliberately **no `Config` export** at all. A
+ * `@deepseek-ai/schemastery` schema would be the other way to satisfy that check,
+ * at the price of one more peer range to keep admitted across the release lines;
+ * every knob here is read defensively by {@link normalizeConfig} instead, so the
+ * defaults are the same with or without a schema, and the mount cannot be broken
+ * by a dependency the doctor does not need.
  * @param ctx - the plugin context.
  * @param config - the plugin configuration.
  */
