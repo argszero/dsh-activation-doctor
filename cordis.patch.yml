@@ -1,0 +1,60 @@
+# The @argszero/dsh-activation-doctor bundle patch: mount and go.
+#
+# One report (#9308) describes a plugin that registered a tool whose name was
+# already taken. The registration threw before any insertion, the error left the
+# plugin body, and the fiber unloaded whole — taking every tool and every prompt
+# section that plugin had contributed. The marketplace row still said installed
+# and enabled; no UI showed anything; and the operator's search for a log found
+# zero hits.
+#
+# Zero hits is structural, and three facts in the shipped source say why:
+#
+# 1. The failure *is* logged, into a sink nobody reads. `Fiber._reload()` catches
+#    the body's throw, calls `this.ctx.logger.error(reason)`, records the error
+#    and unloads the fiber (vendor/cordis/src/fiber.ts). Neither shipped profile
+#    mounts a logger sink.
+# 2. Startup only *fails* for core entry ids. `auditStartupEntries` marks an entry
+#    required only when its id is in the built-in set or it is the bootstrap
+#    include (packages/boot/app-boot/src/index.ts), so a third-party failure takes
+#    the `warn` branch: one line to `process.stderr`, and the rest of the
+#    application starts normally.
+# 3. The durable report is written only on that fatal path.
+#    `reportStartupFailure` has exactly one caller — the `StartupError` handler in
+#    apps/cli/src/bin.ts — so `$DSH_HOME/logs/startup-*.log` is never created for a
+#    third-party-only failure. In the desktop build the stderr line drains into a
+#    64 KiB in-memory buffer (apps/desktop/src/host-process.ts) that is attached to
+#    an error message only on exit.
+#
+# So the missing piece is not a change to the loader, the registry or the audit
+# policy — it is a **sink**. The state a report needs is already public:
+#
+#   for (const entry of ctx.loader.entries())   // this tree and every subtree
+#     entry.options.id, entry.options.name      // what a profile or patch row names
+#     entry.disabled                            // a decision, not a failure
+#     entry.fiber                               // absent when the import itself failed
+#     await entry.fiber.await()                 // rethrows the original error + stack
+#                                               // (cordis-plugin-loader/lib/index.js:142-158,
+#                                               //  vendor/cordis/src/fiber.ts:704-708)
+#
+# This patch mounts the sink, and changes nothing else. It reads the tree once the
+# loader has no pending tasks, classifies each entry (disabled / import-failed /
+# failed / active / pending-waiting-for-a-service / unknown), writes a private
+# report under `$DSH_HOME/logs`, prints one line, keeps watching so a failure that
+# appears later — a hot reload, a profile patch re-application, a plugin mounted
+# after startup — is reported too, and answers `activation_status` on demand.
+#
+# It is a detector, not a repairer. It does not revive the failed plugin, does not
+# change registration semantics, does not touch the marketplace row, and cannot
+# move the desktop's stderr. A plugin whose tool name collides still fails; the
+# difference is that the operator can now find out which two plugins, which name,
+# and from where.
+#
+# `inject` is declared here as well as in the plugin because the entry row is what
+# a profile composes: without the loader there is no entry tree to sweep, and a
+# doctor that activates without one would report an empty world as healthy.
+
+- insert:
+    - id: activation-doctor
+      name: '@argszero/dsh-activation-doctor'
+      inject:
+        - loader
