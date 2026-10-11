@@ -276,6 +276,13 @@ const MUTATIONS = [
     edits: [['  if (audit.declared === undefined) return `profileBundles: the declaration could not be read — ${String(audit.declaredError)}`', '  if (audit.declared === undefined) return `profileBundles: 0 declared, ${String(audit.started.length)} started`']],
   },
   {
+    // "The reasons are unavailable" without saying *why* is a shrug; the error is
+    // the difference between "your launcher moved" and "the name is misspelled".
+    name: 'report: unavailable reasons are stated without the error',
+    file: 'src/report.ts',
+    edits: [["    : `reasons: unavailable — ${String(audit.reasonsError)}`)", "    : 'reasons: unavailable — unknown')"]],
+  },
+  {
     name: 'report: the composition header states the counts without the shortfall',
     file: 'src/report.ts',
     edits: [['  return stopped.length === 0 ? head : `${head}, ${String(stopped.length)} did not start`', '  return head']],

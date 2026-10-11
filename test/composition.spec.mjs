@@ -362,12 +362,13 @@ describe('the composition in a running process', () => {
       assert.match(report, /profileBundles: 2 declared, 1 started, 1 did not start/)
       assert.match(report, /profile composition/)
       assert.match(report, /@acme\/dsh-missing-plugin/)
-      // Where the reasons came from is stated either way — recovered from the
-      // launcher, or unavailable and why — and both spellings name the launcher.
-      // Asserting the invariant rather than one branch keeps this arm measuring
-      // the plugin on a tree that carries app-boot and one that does not; which
-      // branch *this* tree takes is pinned by the arm that reads the launcher.
-      assert.match(report, /^reasons: .*dsh-app-boot.*$/m)
+      // The report states where the reasons came from either way: recovered from
+      // the launcher, or unavailable *with a reason why* — never a blank. Asserted
+      // as the invariant rather than as one branch, so the arm measures the plugin
+      // on a tree that carries app-boot and on one that does not; which branch
+      // *this* tree takes is pinned by the arm that reads the launcher, and both
+      // spellings are pinned exactly by the renderer arm above.
+      assert.match(report, /^reasons: (recovered from @deepseek-ai\/dsh-app-boot|unavailable — \S.*)$/m)
       // With no entry finding there is no entry paragraph to write.
       assert.doesNotMatch(report, /still installed and still enabled/)
     } finally {
