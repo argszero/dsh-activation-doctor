@@ -111,8 +111,10 @@ describe('the durable report', () => {
     assert.match(report.text, /already registered/)
     assert.match(report.text, /collide-b\.mjs:\d+/, 'the stack names the fixture that threw')
     assert.match(report.text, /still installed and still enabled/)
-    // The terminal line and the file are the same finding, so the line points at it.
-    assert.ok(w.stderr.text().includes(report.path), 'the summary names the report path')
+    // The terminal line and the file are the same finding, so the line points at
+    // it. Waited for rather than read: the file is written first, so a synchronous
+    // read here is a race the suite loses whenever the machine is busy.
+    assert.ok(await waitFor(() => w.stderr.text().includes(report.path)), 'the summary names the report path')
   })
 
   it('reports an entry whose module could not be imported at all', async () => {
@@ -338,7 +340,13 @@ describe('the package itself', () => {
         entries: [collideEntry('collide-a', 'a'), collideEntry('collide-b', 'b')],
         config: { reportDir: join(root, 'fresh-logs') },
       })
-      assert.ok(await waitFor(() => existsSync(join(root, 'fresh-logs'))), 'the directory is created on demand')
+      // Wait for the *line*, not for the directory: the report is written before
+      // the summary is printed, and the directory appears inside that write — so
+      // waiting on the directory alone reads stderr one step early.
+      assert.ok(
+        await waitFor(() => existsSync(join(root, 'fresh-logs')) && w.stderr.text().includes('activation-doctor:')),
+        'the directory is created on demand and the finding is printed',
+      )
       assert.equal(statSync(join(root, 'fresh-logs')).mode & 0o777, 0o700)
       assert.match(w.stderr.text(), /activation-doctor: 1 entry did not activate/)
     } finally {

@@ -55,7 +55,11 @@ function captureStderr() {
  * @param spec - `doctor: false` mounts everything except the doctor (the control
  *   arm); `doctor: 'entry'` mounts it the way a profile does, as a loader entry;
  *   `config` is the doctor's configuration; `entries` are the fixture entries to
- *   create after the doctor; `home` overrides the harness home directory.
+ *   create after the doctor; `home` overrides the harness home directory;
+ *   `profileContext` is the launcher's own service, provided exactly as a real
+ *   `dsh` profile provides it — absent means this process is a plain cordis
+ *   application, which is the other half of what the composition section has to
+ *   get right.
  * @returns the context, the loader, the stderr capture, the home directory and a
  *   `dispose` that restores the process sink and removes the home directory.
  */
@@ -66,6 +70,10 @@ export async function world(spec = {}) {
   process.env.DSH_HOME = home
 
   const ctx = new Context()
+  // The launcher's service, provided the way app-boot provides it — as a plain
+  // service on the root context, before any fiber exists. A world that omits it
+  // reproduces a plain cordis application, where `ctx.get` answers `undefined`.
+  if (spec.profileContext !== undefined) ctx.provide('profileContext', spec.profileContext)
   await ctx.plugin(Loader, { baseUrl: BASE_URL })
   // `SystemPrompt` first: the real `ToolRuntime` constructor wires its schema
   // catalog into `ctx.systemPrompt`, so mounting it alone would leave a failed

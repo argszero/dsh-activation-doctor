@@ -198,6 +198,103 @@ const MUTATIONS = [
     file: 'src/index.ts',
     edits: [['  if (!settings.enabled) return', '  if (false) return']],
   },
+  {
+    // The whole point of the composition half: a bundle the profile names and the
+    // process did not start from contributes no entries, so the entry sweep cannot
+    // see it and nothing else will. Dropping the diff is the plugin shipping the
+    // blind spot it was added to close.
+    name: 'composition: a declared bundle the process did not start from is not looked for',
+    file: 'src/composition.ts',
+    edits: [['  const missingNames = declared === undefined ? [] : declared.filter(name => !started.has(name))', '  const missingNames: string[] = []']],
+  },
+  {
+    // One accessor feeds the summary, the report and the query, so mutating it is
+    // mutating "what counts as a finding" for all three at once.
+    name: 'composition: the stopped-bundle accessor always answers "nothing"',
+    file: 'src/composition.ts',
+    edits: [['  return audit?.missing ?? []', '  return []']],
+  },
+  {
+    // The launcher is a dynamic import. The healthy case is every start, so it is
+    // the one that must not reach for it.
+    name: 'composition: the launcher\'s reader is consulted even when nothing is missing',
+    file: 'src/composition.ts',
+    edits: [['  if (missingNames.length > 0) {', '  if (missingNames.length >= 0) {']],
+  },
+  {
+    // "Declared nothing" and "could not be read" lead to opposite conclusions about
+    // the process, so a malformed declaration must not render as an empty one.
+    name: 'composition: a malformed declaration reads as an empty one',
+    file: 'src/composition.ts',
+    edits: [["  if (!Array.isArray(bundles)) return { error: 'dsh.profile.bundles is not a list' }", '  if (!Array.isArray(bundles)) return { bundles: [] }']],
+  },
+  {
+    // A launcher fact the module cannot read is reported as "not a profile", never
+    // coerced into a composition claim about a process it has no facts about.
+    name: 'composition: a profile with no directory is accepted',
+    file: 'src/composition.ts',
+    edits: [["  if (typeof probe.dir !== 'string' || probe.dir === '') return undefined", "  if (typeof probe.dir !== 'string') return undefined"]],
+  },
+  {
+    name: 'composition: a non-string bundle in the launcher\'s list is filtered away instead of refused',
+    file: 'src/composition.ts',
+    edits: [['  if (startedBundles.length !== probe.startedBundles.length) return undefined', '  if (false) return undefined']],
+  },
+  {
+    // The reader is addressed through the launcher's own install anchor; without
+    // one there is nothing to resolve it from, and calling anyway is guessing.
+    name: 'composition: the launcher is addressed without an install anchor',
+    file: 'src/composition.ts',
+    edits: [["    if (facts.installAnchor === '') {", '    if (false) {']],
+  },
+  {
+    // The file is what an operator reads later. A composition finding that lives
+    // only in the terminal line is a finding the report does not carry.
+    name: 'report: the composition section is never written',
+    file: 'src/report.ts',
+    edits: [['  if (audit === undefined || stopped.length === 0) return []', '  if (audit === undefined || stopped.length >= 0) return []']],
+  },
+  {
+    // A healthy entry tree is not a healthy composition — the case the second half
+    // of that condition exists for.
+    name: 'report: an empty entry list suppresses the terminal line',
+    file: 'src/report.ts',
+    edits: [["  if (found.length === 0 && stopped.length === 0) return ''", "  if (found.length === 0) return ''"]],
+  },
+  {
+    // "The launcher gave no reason" is information, and a bundle rendered with an
+    // empty explanation reads as a truncated line rather than as a finding.
+    name: 'report: a stopped bundle with no reason is rendered blank',
+    file: 'src/report.ts',
+    edits: [["  const text = (bundle.reason ?? 'the launcher reported no reason for this one').replace(/\\s+/g, ' ').trim()", "  const text = (bundle.reason ?? '').replace(/\\s+/g, ' ').trim()"]],
+  },
+  {
+    // "The profile names no bundles" and "this process could not read what it
+    // names" are opposite facts about the process.
+    name: 'report: an unreadable declaration is rendered as an empty one',
+    file: 'src/report.ts',
+    edits: [['  if (audit.declared === undefined) return `profileBundles: the declaration could not be read — ${String(audit.declaredError)}`', '  if (audit.declared === undefined) return `profileBundles: 0 declared, ${String(audit.started.length)} started`']],
+  },
+  {
+    name: 'report: the composition header states the counts without the shortfall',
+    file: 'src/report.ts',
+    edits: [['  return stopped.length === 0 ? head : `${head}, ${String(stopped.length)} did not start`', '  return head']],
+  },
+  {
+    name: 'sweep: the composition is never audited',
+    file: 'src/index.ts',
+    edits: [['      if (!settings.composition || state.compositionAudited) return undefined', '      if (settings.composition) return undefined']],
+  },
+  {
+    name: 'sweep: a healthy entry tree suppresses the composition finding',
+    file: 'src/index.ts',
+    edits: [['      if (fresh.length === 0 && stopped.length === 0) return', '      if (fresh.length === 0) return']],
+  },
+  {
+    name: 'sweep: the on-demand query reports the composition even when it is switched off',
+    file: 'src/index.ts',
+    edits: [['composition: settings.composition ? composition : undefined }', 'composition }']],
+  },
 ]
 
 const argv = process.argv.slice(2)

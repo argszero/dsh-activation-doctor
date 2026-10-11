@@ -27,6 +27,8 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { formatError, isProblem } from './audit.ts'
 import type { EntryAudit } from './audit.ts'
+import { APP_BOOT, stoppedBundles } from './composition.ts'
+import type { CompositionAudit, StoppedBundle } from './composition.ts'
 
 /** The warning the shipped diagnostic puts at the top of its report. */
 export const CREDENTIAL_WARNING = 'WARNING: Raw diagnostics may contain configuration or credential values from plugin errors. Review before sharing.'
@@ -48,6 +50,13 @@ export interface ReportContext {
   readonly settled: boolean
   /** How many entries the sweep inspected, when it is more than the rows given. */
   readonly totalEntries?: number | undefined
+  /**
+   * The profile composition audit, when this process is a dsh profile.
+   *
+   * Absent is a fact rather than a gap: a plain cordis application has no profile
+   * to audit, and the report says so by not making a claim about one.
+   */
+  readonly composition?: CompositionAudit | undefined
 }
 
 /** Rendering bounds shared by every projection of one sweep. */
@@ -92,6 +101,52 @@ function firstLine(row: EntryAudit, limit: number): string {
 }
 
 /**
+ * One stopped bundle, collapsed to a line.
+ *
+ * A bundle with no reason is stated as such rather than omitted: the finding is
+ * that it did not start, and a reader who is shown the name with no explanation
+ * learns exactly as much as the doctor knows.
+ * @param bundle - a declared bundle that contributed no layer.
+ * @param limit - the inclusive bound on the rendered text.
+ * @returns the terminal text for this bundle.
+ */
+function stoppedLine(bundle: StoppedBundle, limit: number): string {
+  const text = (bundle.reason ?? 'the launcher reported no reason for this one').replace(/\s+/g, ' ').trim()
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+/** The header line summarising one composition audit, or `undefined` without one. */
+function compositionFact(audit: CompositionAudit | undefined): string | undefined {
+  if (audit === undefined) return undefined
+  if (audit.declared === undefined) return `profileBundles: the declaration could not be read — ${String(audit.declaredError)}`
+  const stopped = stoppedBundles(audit)
+  const head = `profileBundles: ${String(audit.declared.length)} declared, ${String(audit.started.length)} started`
+  return stopped.length === 0 ? head : `${head}, ${String(stopped.length)} did not start`
+}
+
+/** The composition section of the durable report, or an empty list without a finding. */
+function compositionSection(audit: CompositionAudit | undefined, errorChars: number): readonly string[] {
+  const stopped = stoppedBundles(audit)
+  if (audit === undefined || stopped.length === 0) return []
+  const parts: string[] = []
+  parts.push('', '─'.repeat(72), 'profile composition', '─'.repeat(72))
+  parts.push('The profile named these bundles and this process did not start from them. A bundle is')
+  parts.push('composed before any entry exists, so a skipped one contributes no entries at all — the')
+  parts.push('entry sweep above cannot see it, whatever it would have provided is missing from this')
+  parts.push('process, and the launcher printed its reason once to stderr and carried on.')
+  for (const bundle of stopped) {
+    parts.push('', bundle.packageName)
+    if (bundle.reason !== undefined) parts.push(`  ${formatError(bundle.reason, errorChars)}`)
+    else parts.push('  no reason: the launcher\'s profile loader did not report this bundle')
+  }
+  parts.push('')
+  parts.push(audit.reasons === 'dsh-app-boot'
+    ? `reasons: recovered from ${APP_BOOT} (the launcher's own profile loader)`
+    : `reasons: unavailable — ${String(audit.reasonsError)}`)
+  return parts
+}
+
+/**
  * The terminal projection: what did not activate, and where the full report is.
  *
  * Kept to one line per entry plus one header, because the desktop shell truncates
@@ -101,6 +156,7 @@ function firstLine(row: EntryAudit, limit: number): string {
  * @param options - rendering bounds.
  * @param reportPath - the durable report, when one was written.
  * @param omitted - entries dropped by `maxEntries`.
+ * @param composition - the profile composition audit, when this process is a dsh profile.
  * @returns the text to write to stderr, or `''` when there is nothing to say.
  */
 export function renderSummary(
@@ -108,13 +164,26 @@ export function renderSummary(
   options: RenderOptions,
   reportPath?: string | undefined,
   omitted = 0,
+  composition?: CompositionAudit | undefined,
 ): string {
   const found = problems(rows, options.includePending)
-  if (found.length === 0) return ''
+  const stopped = stoppedBundles(composition)
+  // Either stage being short is a finding on its own. A profile whose bundles
+  // are all present can still have a plugin that failed, and — the case this
+  // half was added for — an entry tree that is entirely healthy can still have
+  // been composed from fewer bundles than the profile names.
+  if (found.length === 0 && stopped.length === 0) return ''
   const shown = found.slice(0, options.maxEntries)
-  const noun = found.length === 1 ? 'entry' : 'entries'
+  const counts: string[] = []
+  if (stopped.length > 0) {
+    counts.push(`${String(stopped.length)} profile ${stopped.length === 1 ? 'bundle' : 'bundles'} did not start`)
+  }
+  if (found.length > 0) counts.push(`${String(found.length)} ${found.length === 1 ? 'entry' : 'entries'} did not activate`)
   const suffix = reportPath === undefined ? '' : ` (report: ${reportPath})`
-  const lines = [`dsh: activation-doctor: ${String(found.length)} ${noun} did not activate${suffix}`]
+  const lines = [`dsh: activation-doctor: ${counts.join('; ')}${suffix}`]
+  for (const bundle of stopped) {
+    lines.push(`  profile bundle ${bundle.packageName}: ${stoppedLine(bundle, options.summaryChars)}`)
+  }
   for (const row of shown) lines.push(`  ${row.id} (${row.name}): ${firstLine(row, options.summaryChars)}`)
   const hidden = found.length - shown.length + omitted
   if (hidden > 0) lines.push(`  … and ${String(hidden)} more (see the report)`)
@@ -149,6 +218,8 @@ export function renderReport(
   parts.push(`settled: ${context.settled ? 'yes' : 'no — the loader still had pending work when this ran'}`)
   if (context.version !== undefined) parts.push(`dshVersion: ${context.version}`)
   if (context.profile !== undefined) parts.push(`profile: ${context.profile}`)
+  const compositionFactLine = compositionFact(context.composition)
+  if (compositionFactLine !== undefined) parts.push(compositionFactLine)
   parts.push(`nodeVersion: ${process.version}`)
   parts.push(`platform: ${process.platform} ${process.arch}`)
   parts.push(`execPath: ${process.execPath}`)
@@ -156,6 +227,7 @@ export function renderReport(
   parts.push(context.phase === 'live'
     ? `new entries did not activate: ${String(found.length)} of ${String(total)} entries in the tree`
     : `entries did not activate: ${String(found.length)} of ${String(total)}`)
+  for (const line of compositionSection(context.composition, options.errorChars)) parts.push(line)
   parts.push('')
   parts.push('index:')
   for (const row of shown) parts.push(`  ${row.id} (${row.name}): ${headline(row, options.summaryChars)}`)
@@ -170,9 +242,11 @@ export function renderReport(
       parts.push(headline(row, options.errorChars))
     }
   }
-  parts.push('', 'Every plugin above is still installed and still enabled: the harness does not roll back a')
-  parts.push('registration, it unloads the fiber that threw. Whatever the plugin contributed is gone for this')
-  parts.push('process. To see the collision that caused it, search the stack for the registration call.')
+  if (found.length > 0) {
+    parts.push('', 'Every plugin above is still installed and still enabled: the harness does not roll back a')
+    parts.push('registration, it unloads the fiber that threw. Whatever the plugin contributed is gone for this')
+    parts.push('process. To see the collision that caused it, search the stack for the registration call.')
+  }
   return `${parts.join('\n')}\n`
 }
 

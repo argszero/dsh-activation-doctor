@@ -44,6 +44,15 @@ export interface Config {
   readonly watch?: boolean
   /** Register the `activation_status` tool. Defaults to `true`. */
   readonly tool?: boolean
+  /**
+   * Audit the profile composition as well as the entry tree. Defaults to `true`.
+   *
+   * The audit compares the profile manifest's declared bundles with the launcher's
+   * `startedBundles`, and recovers the launcher's own skip reasons from
+   * `@deepseek-ai/dsh-app-boot`. Switch it off for a deployment that wants the
+   * entry sweep and nothing else.
+   */
+  readonly composition?: boolean
   /** Inclusive bound on the entries listed in one report. Defaults to `50`. */
   readonly maxEntries?: number
   /** Inclusive bound on one entry's rendered error. Defaults to `4000`. */
@@ -65,6 +74,7 @@ export interface Settings {
   readonly includePending: boolean
   readonly watch: boolean
   readonly tool: boolean
+  readonly composition: boolean
   readonly maxEntries: number
   readonly errorChars: number
   readonly maxLiveReports: number
@@ -81,6 +91,7 @@ export const defaultConfig: Required<Config> = {
   includePending: true,
   watch: true,
   tool: true,
+  composition: true,
   maxEntries: 50,
   errorChars: 4000,
   maxLiveReports: 5,
@@ -154,6 +165,7 @@ export function normalizeConfig(config: Config): Settings {
     includePending: boolean(config.includePending, defaultConfig.includePending),
     watch: boolean(config.watch, defaultConfig.watch),
     tool: boolean(config.tool, defaultConfig.tool),
+    composition: boolean(config.composition, defaultConfig.composition),
     maxEntries: positiveInteger(config.maxEntries, defaultConfig.maxEntries),
     errorChars: positiveInteger(config.errorChars, defaultConfig.errorChars),
     maxLiveReports: positiveInteger(config.maxLiveReports, defaultConfig.maxLiveReports),

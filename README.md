@@ -49,6 +49,40 @@ So the missing piece is not a fix to the loader, the registry or the audit polic
 its entries (`ctx.loader.entries()`), every entry carries its fiber, and
 `fiber.await()` rethrows the original activation error with its stack.
 
+## The stage before the entries
+
+An entry that failed is still an entry. It has an id, a name and a fiber, which is
+why it can be reported at all. The strictly larger loss is the one shape the entry
+sweep cannot see: a **bundle the profile names and the process did not start from**.
+
+A bundle is composed *before* any entry exists. When the launcher skips one —
+the bundle is not installed, a peer is missing, the name is misspelled — it
+contributes **no entries at all**: no fiber, no `internal/status` event, nothing to
+await. The process starts, every remaining entry activates perfectly, and the
+application runs with a smaller composition than its own configuration declares.
+That is
+[#9451](https://github.com/deepseek-ai/deepseek-harness/discussions/9451): for such
+a profile, `dsh` and `--dump-config` both exit `0`, and the launcher prints the
+skip reason once to stderr and carries on.
+
+The doctor reports this too. It diffs the profile manifest's declared bundles
+against the launcher's own `ctx.profileContext.startedBundles`, and for each name
+that did not contribute it recovers the launcher's skip reason from
+`@deepseek-ai/dsh-app-boot`'s `loadProfileDirectory(...).skippedBundles` — read as
+a package at runtime, so **this plugin still declares no dependency on it**. Where
+the launcher is unreachable the finding stands and the report says the reason is
+unavailable, naming why.
+
+| `profileBundles` header line | meaning |
+|------------------------------|---------|
+| `2 declared, 2 started` | every declared bundle contributed |
+| `2 declared, 1 started, 1 did not start` | one name in the manifest contributed nothing |
+| `the declaration could not be read — …` | the manifest was missing or malformed. **Not** the same as "names no bundles" |
+
+A third-party entry failure takes the `warn` branch of `auditStartupEntries`, so
+nothing can turn a partial composition into an exit status from outside the
+launcher — the report is where an operator can see it.
+
 ## Install
 
 **In the application (the Desktop shell, and the Web UI).** Desktop's profile is
@@ -135,6 +169,9 @@ else:
   running" is a question you ask *after* the process is up, usually while looking
   at a session in which a tool you expect is missing. The answer comes from the
   same sweep as the report, so the two can never disagree.
+- **Audits the profile composition as well.** A bundle the launcher skipped
+  contributes no entries, so the sweep above cannot see it. See
+  [the stage before the entries](#the-stage-before-the-entries).
 
 ## Configuration
 
@@ -145,6 +182,7 @@ else:
 | `report` | `true` | write the durable file |
 | `reportDir` | `$DSH_HOME/logs` | where reports are written; a leading `~` is expanded |
 | `includePending` | `true` | list entries waiting for a service |
+| `composition` | `true` | audit the profile's declared bundles against what this process started from |
 | `watch` | `true` | re-report failures that appear after the first sweep |
 | `tool` | `true` | register the `activation_status` tool |
 | `maxEntries` | `50` | inclusive bound on the entries listed |
@@ -176,6 +214,17 @@ admitted across the release lines.
   redirect what is already there. The report file is the answer to that.
 - **It is not a policy change.** Registration semantics, the marketplace row and
   the startup-audit required-id set are all untouched.
+- **It does not re-import a module to explain an `import-failed` entry.** The
+  obvious way to recover that reason is to import the entry's specifier again and
+  catch the throw — but that re-executes third-party module code inside the
+  doctor's own context, for a plugin the harness has already decided not to load,
+  and it would contradict the promise above that the doctor never touches the
+  plugin that failed. A resolve-only probe (`import.meta.resolve`,
+  `createRequire(...).resolve`) executes nothing, but it has to resolve from the
+  entry's own base URL, and no public surface the doctor reads exposes it — so the
+  probe would answer about the doctor's location instead and be wrong for exactly
+  the relative specifiers it was meant to explain. The entry is reported by id and
+  name, and the harness's own import error is not replaced by a guess.
 - **`reportDir` has no access to a launcher-configured home.** The harness's own
   `resolveDshHome` honours an explicit configured path supplied by the launcher; a
   plugin mounted from a patch cannot see that value. If you configure a non-default

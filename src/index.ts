@@ -73,6 +73,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { auditEntries, findingKey, formatError, isProblem, pendingTasks } from './audit.ts'
 import type { EntryAudit, LoaderLike } from './audit.ts'
+import { auditComposition, stoppedBundles } from './composition.ts'
+import type { CompositionAudit } from './composition.ts'
 import { defaultConfig, normalizeConfig } from './config.ts'
 import type { Config, Settings } from './config.ts'
 import { problems, renderReport, renderSummary, writeReport } from './report.ts'
@@ -91,6 +93,8 @@ export const inject = ['loader']
 
 export type { Config, Settings, LogMode } from './config.ts'
 export { defaultConfig, normalizeConfig, resolveHome, expandHome } from './config.ts'
+export type { CompositionAudit, ProfileFacts, ReasonReader, StoppedBundle } from './composition.ts'
+export { APP_BOOT, auditComposition, profileFactsOf, readDeclaredBundles, readSkippedBundles, stoppedBundles } from './composition.ts'
 export type { EntryAudit, EntryLike, FiberLike, LoaderLike, Outcome } from './audit.ts'
 export { auditEntries, classifyEntry, findingKey, formatError, isProblem, pendingTasks } from './audit.ts'
 export type { ReportContext, RenderOptions } from './report.ts'
@@ -109,6 +113,10 @@ interface DoctorState {
   lastReportPath: string | undefined
   /** Whether the startup sweep has run. */
   started: boolean
+  /** The composition audit, cached for the on-demand query. */
+  composition: CompositionAudit | undefined
+  /** Whether the composition audit has been attempted; it is a once-per-process fact. */
+  compositionAudited: boolean
 }
 
 /** Read the loader service through the reflection layer, structurally. */
@@ -181,7 +189,12 @@ function renderOptions(settings: Settings): RenderOptions {
  * @returns the tool definition.
  */
 function statusTool(
-  sweep: () => Promise<{ rows: readonly EntryAudit[], settled: boolean, reportPath: string | undefined }>,
+  sweep: () => Promise<{
+    rows: readonly EntryAudit[]
+    settled: boolean
+    reportPath: string | undefined
+    composition: CompositionAudit | undefined
+  }>,
   options: RenderOptions,
 ): ToolDefinition {
   return defineTool({
@@ -197,14 +210,22 @@ function statusTool(
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute() {
-      const { rows, settled, reportPath } = await sweep()
+      const { rows, settled, reportPath, composition } = await sweep()
       const found = problems(rows, options.includePending)
+      const stopped = stoppedBundles(composition)
       const header = `activation-doctor: ${String(rows.length)} loader ${rows.length === 1 ? 'entry' : 'entries'} inspected`
         + `${settled ? '' : ' (the loader still had pending work when this ran)'}`
         + `${reportPath === undefined ? '' : `; last report: ${reportPath}`}`
-      if (found.length === 0) return `${header}\nEvery entry is active (or switched off deliberately).`
-      const summary = renderSummary(rows, options, reportPath)
-      return `${header}\n\n${summary}`
+        // Said rather than omitted: a caller asking this question about a host
+        // with no profile has to be able to tell "nothing was composed badly"
+        // from "there was nothing to compose".
+        + `${composition === undefined ? '; no profile composition to audit (this process was not launched from a dsh profile)' : ''}`
+      if (found.length === 0 && stopped.length === 0) {
+        return `${header}\nEvery entry is active (or switched off deliberately).`
+      }
+      const summary = renderSummary(rows, options, reportPath, 0, composition)
+      const healthy = found.length === 0 ? 'Every entry is active (or switched off deliberately).\n' : ''
+      return `${header}\n\n${healthy}${summary}`
     },
   })
 }
@@ -236,7 +257,14 @@ export function apply(ctx: Context, config: Config = {}): void {
   const options = renderOptions(settings)
 
   ctx.effect(() => {
-    const state: DoctorState = { reported: new Set<string>(), liveReports: 0, lastReportPath: undefined, started: false }
+    const state: DoctorState = {
+      reported: new Set<string>(),
+      liveReports: 0,
+      lastReportPath: undefined,
+      started: false,
+      composition: undefined,
+      compositionAudited: false,
+    }
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
 
@@ -259,17 +287,48 @@ export function apply(ctx: Context, config: Config = {}): void {
       return { rows: loader === undefined ? [] : await auditEntries(loader), settled: false }
     }
 
+    /**
+     * Audit the profile composition, once per process.
+     *
+     * Once, because the answer is a launch fact: `startedBundles` is what this
+     * process was *composed from* and cannot change while it runs. The cache is
+     * kept for the on-demand query, and the return value is deliberately
+     * `undefined` after the first call so that a later sweep does not re-report a
+     * finding that has not changed — the same reason the entry sweep keeps
+     * `state.reported`.
+     */
+    const auditOnce = async (): Promise<CompositionAudit | undefined> => {
+      if (!settings.composition || state.compositionAudited) return undefined
+      state.compositionAudited = true
+      try {
+        state.composition = await auditComposition(ctx)
+      } catch {
+        // The audit is itself wrapped defensively, so this is belt and braces: a
+        // diagnostic that throws is worse than a diagnostic that is silent.
+        state.composition = undefined
+      }
+      return state.composition
+    }
+
     /** Write the report and the terminal line for one sweep's fresh findings. */
     const emit = async (
       phase: 'startup' | 'live',
       total: number,
       settled: boolean,
       fresh: readonly EntryAudit[],
+      composition: CompositionAudit | undefined,
     ): Promise<void> => {
       const now = new Date()
       let reportPath = state.lastReportPath
       if (settings.report) {
-        const text = renderReport(fresh, { phase, settled, totalEntries: total, version: versionOf(ctx), profile: profileOf() }, options, now)
+        const text = renderReport(fresh, {
+          phase,
+          settled,
+          totalEntries: total,
+          version: versionOf(ctx),
+          profile: profileOf() ?? composition?.profile,
+          composition,
+        }, options, now)
         try {
           reportPath = await writeReport(settings.reportDir, text, now)
           state.lastReportPath = reportPath
@@ -282,7 +341,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       }
       if (settings.log === 'off') return
-      const summary = renderSummary(fresh, options, reportPath)
+      const summary = renderSummary(fresh, options, reportPath, 0, composition)
       if (summary !== '') process.stderr.write(summary)
     }
 
@@ -291,6 +350,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (disposed) return
       const { rows, settled } = await settledSweep(settings.maxSettleTries)
       if (disposed) return
+      // The composition is audited on the startup sweep. It does not depend on
+      // the loader having settled — the profile was composed before any entry
+      // existed — but it is reported with the same sweep so the file and the
+      // line carry one picture of the process.
+      const composition = await auditOnce()
+      if (disposed) return
+      const stopped = stoppedBundles(composition)
       const found = problems(rows, settings.includePending)
       if (settled) {
         // A finding that has healed is forgotten, so a genuine re-failure is
@@ -299,7 +365,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         for (const key of [...state.reported]) if (!live.has(key)) state.reported.delete(key)
       }
       const fresh = found.filter(row => !state.reported.has(findingKey(row)))
-      if (fresh.length === 0) return
+      // A healthy entry tree is not a healthy composition: the case this half
+      // exists for is a profile that started with fewer bundles than it names
+      // and every remaining entry activating perfectly.
+      if (fresh.length === 0 && stopped.length === 0) return
       for (const row of fresh) state.reported.add(findingKey(row))
       if (phase === 'live' && state.liveReports >= settings.maxLiveReports) {
         if (settings.log !== 'off') {
@@ -308,7 +377,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
         return
       }
-      await emit(phase, rows.length, settled, fresh)
+      await emit(phase, rows.length, settled, fresh, composition)
     }
 
     /** Debounce a sweep; the tree going quiet is what ends the wait. */
@@ -346,7 +415,11 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (tools === undefined) return
         const dispose = tools.register(statusTool(async () => {
           const { rows, settled } = await settledSweep(Math.min(settings.maxSettleTries, 20))
-          return { rows, settled, reportPath: state.lastReportPath }
+          // The audit is a launch fact, so the query answers from the cache the
+          // startup sweep filled rather than reading the profile again; asking a
+          // second time could describe a composition this process never ran with.
+          const composition = state.compositionAudited ? state.composition : await auditComposition(ctx)
+          return { rows, settled, reportPath: state.lastReportPath, composition: settings.composition ? composition : undefined }
         }, options))
         return () => { dispose() }
       })
