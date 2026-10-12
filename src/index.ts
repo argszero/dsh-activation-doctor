@@ -39,6 +39,20 @@
  * after startup — is reported too. `activation_status` answers the same question
  * inside a session, on demand.
  *
+ * ## The third stage: installed and never selected
+ *
+ * The sweep answers "which plugin did not activate" and the composition arm
+ * answers "which named bundle did not start". Neither can see a package that was
+ * installed and never entered the bundle list at all, because such a package
+ * appears in no list the running process holds — the profile manifest agrees with
+ * itself and the package is simply absent. `installed.ts` reads the profile's
+ * `dependencies`, resolves each one the way the loader resolves a bundle, and
+ * reports the ones whose own manifest declares `dsh.bundle`: those are exactly the
+ * packages the harness's `reconcile` step would have selected, and a failed or
+ * interrupted `dsh plugin add` is how they come to be missing (discussion #9261).
+ * It is a file read, so it needs no runtime service and is answered before the
+ * first entry exists.
+ *
  * ## Why the sweep waits for the tree to settle
  *
  * An entry that has not finished importing has no fiber yet, and the sweep would
@@ -75,6 +89,7 @@ import { auditEntries, findingKey, formatError, isProblem, pendingTasks } from '
 import type { EntryAudit, LoaderLike } from './audit.ts'
 import { auditComposition, stoppedBundles } from './composition.ts'
 import type { CompositionAudit } from './composition.ts'
+import { unselectedPackages } from './installed.ts'
 import { defaultConfig, normalizeConfig } from './config.ts'
 import type { Config, Settings } from './config.ts'
 import { problems, renderReport, renderSummary, writeReport } from './report.ts'
@@ -94,7 +109,10 @@ export const inject = ['loader']
 export type { Config, Settings, LogMode } from './config.ts'
 export { defaultConfig, normalizeConfig, resolveHome, expandHome } from './config.ts'
 export type { CompositionAudit, ProfileFacts, ReasonReader, StoppedBundle } from './composition.ts'
-export { APP_BOOT, auditComposition, profileFactsOf, readDeclaredBundles, readSkippedBundles, stoppedBundles } from './composition.ts'
+export { APP_BOOT, auditComposition, profileFactsOf, readDeclaredBundles, readDeclaredProfile, readSkippedBundles, stoppedBundles } from './composition.ts'
+export type { DeclaredProfile } from './composition.ts'
+export type { AnchorKind, DependencyManifest, InstalledAudit, PackageReader, UninspectedDependency, UnselectedPackage } from './installed.ts'
+export { MAX_INSPECTED, auditInstalledSelection, inspectManifest, packageDirFor, searchPathsFor, unselectedPackages } from './installed.ts'
 export type { EntryAudit, EntryLike, FiberLike, LoaderLike, Outcome } from './audit.ts'
 export { auditEntries, classifyEntry, findingKey, formatError, isProblem, pendingTasks } from './audit.ts'
 export type { ReportContext, RenderOptions } from './report.ts'
@@ -202,8 +220,9 @@ function statusTool(
     description: 'Report which plugins did not activate in this process, and why. '
       + 'A plugin that fails while registering — most often because a tool or prompt-section name it registers '
       + 'is already taken — is unloaded whole: every tool and prompt section it contributed is gone, while the '
-      + 'marketplace still shows it installed. Use this to find out whether a plugin you expect is missing, '
-      + 'which one it is, and the original error it threw.',
+      + 'marketplace still shows it installed. It also reports a package that is installed and was never '
+      + 'selected as a profile bundle, which is the state a failed or interrupted install leaves behind. '
+      + 'Use this to find out whether a plugin you expect is missing, which one it is, and why.',
     parameters: {},
     output: {
       schema: { type: 'string' },
@@ -213,6 +232,7 @@ function statusTool(
       const { rows, settled, reportPath, composition } = await sweep()
       const found = problems(rows, options.includePending)
       const stopped = stoppedBundles(composition)
+      const unselected = unselectedPackages(composition)
       const header = `activation-doctor: ${String(rows.length)} loader ${rows.length === 1 ? 'entry' : 'entries'} inspected`
         + `${settled ? '' : ' (the loader still had pending work when this ran)'}`
         + `${reportPath === undefined ? '' : `; last report: ${reportPath}`}`
@@ -220,8 +240,13 @@ function statusTool(
         // with no profile has to be able to tell "nothing was composed badly"
         // from "there was nothing to compose".
         + `${composition === undefined ? '; no profile composition to audit (this process was not launched from a dsh profile)' : ''}`
-      if (found.length === 0 && stopped.length === 0) {
-        return `${header}\nEvery entry is active (or switched off deliberately).`
+      if (found.length === 0 && stopped.length === 0 && unselected.length === 0) {
+        // The second sentence is added only when that arm actually ran: a host
+        // with no profile, or one whose manifest could not be read, has not
+        // earned the claim, and an unearned "all clear" is the failure mode this
+        // plugin exists to remove.
+        const selected = composition?.installed === undefined ? '' : ' Every installed bundle was selected.'
+        return `${header}\nEvery entry is active (or switched off deliberately).${selected}`
       }
       const summary = renderSummary(rows, options, reportPath, 0, composition)
       const healthy = found.length === 0 ? 'Every entry is active (or switched off deliberately).\n' : ''
@@ -301,7 +326,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (!settings.composition || state.compositionAudited) return undefined
       state.compositionAudited = true
       try {
-        state.composition = await auditComposition(ctx)
+        state.composition = await auditComposition(ctx, undefined, { installed: settings.installed })
       } catch {
         // The audit is itself wrapped defensively, so this is belt and braces: a
         // diagnostic that throws is worse than a diagnostic that is silent.
@@ -357,6 +382,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const composition = await auditOnce()
       if (disposed) return
       const stopped = stoppedBundles(composition)
+      const unselected = unselectedPackages(composition)
       const found = problems(rows, settings.includePending)
       if (settled) {
         // A finding that has healed is forgotten, so a genuine re-failure is
@@ -367,8 +393,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       const fresh = found.filter(row => !state.reported.has(findingKey(row)))
       // A healthy entry tree is not a healthy composition: the case this half
       // exists for is a profile that started with fewer bundles than it names
-      // and every remaining entry activating perfectly.
-      if (fresh.length === 0 && stopped.length === 0) return
+      // and every remaining entry activating perfectly. Nor is a composition that
+      // matches its manifest a healthy installation: the third case is a package
+      // installed and never selected, where the manifest agrees with itself and
+      // the package is simply absent.
+      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0) return
       for (const row of fresh) state.reported.add(findingKey(row))
       if (phase === 'live' && state.liveReports >= settings.maxLiveReports) {
         if (settings.log !== 'off') {
@@ -418,7 +447,9 @@ export function apply(ctx: Context, config: Config = {}): void {
           // The audit is a launch fact, so the query answers from the cache the
           // startup sweep filled rather than reading the profile again; asking a
           // second time could describe a composition this process never ran with.
-          const composition = state.compositionAudited ? state.composition : await auditComposition(ctx)
+          const composition = state.compositionAudited
+            ? state.composition
+            : await auditComposition(ctx, undefined, { installed: settings.installed })
           return { rows, settled, reportPath: state.lastReportPath, composition: settings.composition ? composition : undefined }
         }, options))
         return () => { dispose() }

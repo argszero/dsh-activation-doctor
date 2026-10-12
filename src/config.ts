@@ -53,6 +53,16 @@ export interface Config {
    * entry sweep and nothing else.
    */
   readonly composition?: boolean
+  /**
+   * Also check which installed dependencies the profile never selected as bundles.
+   * Defaults to `true`.
+   *
+   * The arm resolves and reads one manifest per dependency the profile did not
+   * select, and reports the ones that declare `dsh.bundle` — the packages the
+   * harness's own reconcile step would have added to `dsh.profile.bundles`. It is
+   * part of the `composition` section, so `composition: false` switches it off too.
+   */
+  readonly installed?: boolean
   /** Inclusive bound on the entries listed in one report. Defaults to `50`. */
   readonly maxEntries?: number
   /** Inclusive bound on one entry's rendered error. Defaults to `4000`. */
@@ -75,6 +85,7 @@ export interface Settings {
   readonly watch: boolean
   readonly tool: boolean
   readonly composition: boolean
+  readonly installed: boolean
   readonly maxEntries: number
   readonly errorChars: number
   readonly maxLiveReports: number
@@ -92,6 +103,7 @@ export const defaultConfig: Required<Config> = {
   watch: true,
   tool: true,
   composition: true,
+  installed: true,
   maxEntries: 50,
   errorChars: 4000,
   maxLiveReports: 5,
@@ -166,6 +178,7 @@ export function normalizeConfig(config: Config): Settings {
     watch: boolean(config.watch, defaultConfig.watch),
     tool: boolean(config.tool, defaultConfig.tool),
     composition: boolean(config.composition, defaultConfig.composition),
+    installed: boolean(config.installed, defaultConfig.installed),
     maxEntries: positiveInteger(config.maxEntries, defaultConfig.maxEntries),
     errorChars: positiveInteger(config.errorChars, defaultConfig.errorChars),
     maxLiveReports: positiveInteger(config.maxLiveReports, defaultConfig.maxLiveReports),

@@ -83,6 +83,54 @@ A third-party entry failure takes the `warn` branch of `auditStartupEntries`, so
 nothing can turn a partial composition into an exit status from outside the
 launcher — the report is where an operator can see it.
 
+## The stage before the composition
+
+There is one more way to lose a plugin, and both stages above are blind to it: the
+package is **installed and never selected**. It is not in
+`ctx.profileContext.startedBundles` (it contributed no layer) and it is not in
+`dsh.profile.bundles` either (nothing ever added it there), so the two agree, the
+composition looks healthy, and the plugin is simply absent from the process. The
+entry sweep has nothing to report because there is no entry, and the composition
+diff has nothing to report because both of its sides are consistent.
+
+That is [#9261](https://github.com/deepseek-ai/deepseek-harness/discussions/9261):
+`dsh plugin add` installs through the package manager and reconciles afterwards, so
+a run the CLI never finishes leaves the package in `dependencies` and in
+`pnpm-lock.yaml` with `dsh.profile.bundles` untouched. `pnpm install` run by hand, a
+profile edited by a script, an interrupted or killed install — all reach the same
+state, and nothing in the running application can report it, because the only
+artifact of the loss is a list the package is missing from.
+
+The doctor reads those two lists off the same manifest parse and reports the
+difference:
+
+| `profileBundles` header line | meaning |
+|------------------------------|---------|
+| `1 declared, 1 started, 1 installed but never selected` | a dependency declares `dsh.bundle` and is not in the bundle list |
+| `coverage: 2 of 11 dependencies could not be inspected` | how much of the dependency set this arm actually read |
+
+The qualifier is what keeps this from being noise. **Most dependencies are not
+bundles** — a profile's `dependencies` and its `dsh.profile.bundles` are different
+lists on purpose — so the bundle claim is read from each package's own manifest, the
+way the harness's own `bundleManifest` reads it: a dependency is a bundle when its
+`dsh.bundle.patch` is defined. A dependency declaring none is inspected and passed
+over; a dependency whose `dsh.bundle.patch` exists but is neither a file path nor a
+list of them is reported too, because app-boot throws while loading that declaration
+and the profile loses the package either way.
+
+Each dependency is resolved from disk the way the loader resolves a bundle — the
+**installation anchor first, then the profile** — so an in-box package is never
+mistaken for the profile-local copy, and only `package.json` files are read: no
+third-party module is imported to describe one. Dependencies this arm cannot resolve,
+or whose manifest it cannot read, are listed as **coverage**, never as findings: an
+incomplete audit must not read as a broken installation.
+
+Two things are deliberately not checked. The reverse direction — a name in
+`dsh.profile.bundles` that is not a dependency — is the normal shape of a healthy
+profile, since every shipped bundle comes from the installation rather than the
+profile. And a bundle that *is* selected but cannot be loaded is the arm above: the
+launcher reports it in `skippedBundles`.
+
 ## Install
 
 **In the application (the Desktop shell, and the Web UI).** Desktop's profile is
@@ -172,6 +220,10 @@ else:
 - **Audits the profile composition as well.** A bundle the launcher skipped
   contributes no entries, so the sweep above cannot see it. See
   [the stage before the entries](#the-stage-before-the-entries).
+- **Reports installed packages the profile never selected.** The one loss both
+  stages above agree on, because a package that never entered
+  `dsh.profile.bundles` is missing from each list they read. See
+  [the stage before the composition](#the-stage-before-the-composition).
 
 ## Configuration
 
@@ -183,6 +235,7 @@ else:
 | `reportDir` | `$DSH_HOME/logs` | where reports are written; a leading `~` is expanded |
 | `includePending` | `true` | list entries waiting for a service |
 | `composition` | `true` | audit the profile's declared bundles against what this process started from |
+| `installed` | `true` | report installed dependencies that declare a bundle and were never selected |
 | `watch` | `true` | re-report failures that appear after the first sweep |
 | `tool` | `true` | register the `activation_status` tool |
 | `maxEntries` | `50` | inclusive bound on the entries listed |

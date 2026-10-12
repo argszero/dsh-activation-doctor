@@ -226,7 +226,11 @@ const MUTATIONS = [
     // the process, so a malformed declaration must not render as an empty one.
     name: 'composition: a malformed declaration reads as an empty one',
     file: 'src/composition.ts',
-    edits: [["  if (!Array.isArray(bundles)) return { error: 'dsh.profile.bundles is not a list' }", '  if (!Array.isArray(bundles)) return { bundles: [] }']],
+    // Both lists are read through one helper, so mutating it removes the
+    // distinction for `dsh.profile.bundles` and for `dependencies` at once: a
+    // value that is not the shape the key documents is reported, never read as
+    // "this profile declares none".
+    edits: [['  if (!Array.isArray(value)) return { error: `${field} is not a list` }', '  if (!Array.isArray(value)) return { names: [] }']],
   },
   {
     // A launcher fact the module cannot read is reported as "not a profile", never
@@ -257,9 +261,9 @@ const MUTATIONS = [
   {
     // A healthy entry tree is not a healthy composition — the case the second half
     // of that condition exists for.
-    name: 'report: an empty entry list suppresses the terminal line',
+    name: 'report: a healthy entry tree suppresses the composition finding',
     file: 'src/report.ts',
-    edits: [["  if (found.length === 0 && stopped.length === 0) return ''", "  if (found.length === 0) return ''"]],
+    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''", "  if (found.length === 0 && unselected.length === 0) return ''"]],
   },
   {
     // "The launcher gave no reason" is information, and a bundle rendered with an
@@ -285,7 +289,7 @@ const MUTATIONS = [
   {
     name: 'report: the composition header states the counts without the shortfall',
     file: 'src/report.ts',
-    edits: [['  return stopped.length === 0 ? head : `${head}, ${String(stopped.length)} did not start`', '  return head']],
+    edits: [['  if (stopped.length > 0) parts.push(`${String(stopped.length)} did not start`)\n', '']],
   },
   {
     name: 'sweep: the composition is never audited',
@@ -295,12 +299,118 @@ const MUTATIONS = [
   {
     name: 'sweep: a healthy entry tree suppresses the composition finding',
     file: 'src/index.ts',
-    edits: [['      if (fresh.length === 0 && stopped.length === 0) return', '      if (fresh.length === 0) return']],
+    edits: [['      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0) return', '      if (fresh.length === 0 && unselected.length === 0) return']],
   },
   {
     name: 'sweep: the on-demand query reports the composition even when it is switched off',
     file: 'src/index.ts',
     edits: [['composition: settings.composition ? composition : undefined }', 'composition }']],
+  },
+  {
+    // The qualifier, and the reason this arm is not noise. Most dependencies are
+    // not bundles, so a check that reported every dependency missing from the
+    // bundle list would be switched off within a day — and it would be *wrong*:
+    // the two lists are different on purpose.
+    name: 'installed: a dependency that declares no bundle is reported anyway',
+    file: 'src/installed.ts',
+    edits: [['    if (claim.patches === undefined && claim.patchError === undefined) continue', '    if (claim.patches === undefined && claim.patchError !== undefined) continue']],
+  },
+  {
+    // The other half of the same distinction: the packages the arm exists for are
+    // the ones a well-formed `dsh.bundle.patch` names.
+    name: 'installed: a package that declares a bundle is not a finding',
+    file: 'src/installed.ts',
+    edits: [['    if (claim.patches === undefined && claim.patchError === undefined) continue', '    if (claim.patches !== undefined) continue']],
+  },
+  {
+    // A selected package is a non-finding by definition, and resolving it costs a
+    // manifest read per dependency on every healthy start.
+    name: 'installed: a dependency the profile already selected is inspected too',
+    file: 'src/installed.ts',
+    edits: [['  const selected = new Set(input.bundles)', '  const selected = new Set<string>()']],
+  },
+  {
+    // `resolveBundleDir`'s order, not a preference: an in-box bundle comes from the
+    // running installation even when the profile holds a copy of the same name.
+    name: 'installed: the profile is searched before the installation',
+    file: 'src/installed.ts',
+    edits: [["    [installAnchor, 'installation'],\n    [join(dir, 'package.json'), 'profile'],", "    [join(dir, 'package.json'), 'profile'],\n    [installAnchor, 'installation'],"]],
+  },
+  {
+    // A dependency this arm could not resolve is a gap in its coverage. Calling it
+    // a plain dependency is the audit claiming a classification it never made.
+    name: 'installed: an unresolvable dependency is passed over in silence',
+    file: 'src/installed.ts',
+    edits: [["      uninspected.push({\n        packageName,\n        reason: 'not resolvable from the dsh installation or the profile, so it may not be installed',\n      })\n      continue", '      continue']],
+  },
+  {
+    // "I could not read it" and "it is installed and not selected" are opposite
+    // claims: the second one tells the operator to edit their bundle list.
+    name: 'installed: a manifest that could not be read is reported as a finding',
+    file: 'src/installed.ts',
+    edits: [['      uninspected.push({ packageName, reason: `its package.json could not be read: ${describe(error)}` })', "      unselected.push({ packageName, version: undefined, patches: [], patchError: undefined, from: 'profile' })"]],
+  },
+  {
+    // The bound is what keeps a large dependency tree from costing a manifest read
+    // per dependency at every start — and what makes a truncated audit say so.
+    name: 'installed: the inspection bound is not applied',
+    file: 'src/installed.ts',
+    edits: [['    if (inspected >= MAX_INSPECTED) {', '    if (inspected >= MAX_INSPECTED * 1000) {']],
+  },
+  {
+    // `bundleManifest` reads an absent `patch` as "not a bundle". Reading it as an
+    // empty declaration instead reports every ordinary dependency.
+    name: 'installed: an absent dsh.bundle.patch is read as a declaration',
+    file: 'src/installed.ts',
+    edits: [['  if (patch === undefined) return { version: named, patches: undefined, patchError: undefined }', '  if (patch === undefined) return { version: named, patches: [], patchError: undefined }']],
+  },
+  {
+    // The one accessor every projection shares, so mutating it is mutating "what
+    // counts as a finding" for the summary, the report and the query at once.
+    name: 'installed: the unselected accessor always answers "nothing"',
+    file: 'src/installed.ts',
+    edits: [['  return audit?.installed?.unselected ?? []', '  return []']],
+  },
+  {
+    // The defect this arm was written *for*: `dependencies` is an npm map, and
+    // reading it with the list reader `dsh.profile.bundles` uses fails the whole
+    // manifest parse — taking the shipped composition arm down with it. Every
+    // fixture whose manifest omits the key passes; a real profile manifest does not.
+    name: 'composition: dependencies are read as a list rather than the map npm writes',
+    file: 'src/composition.ts',
+    edits: [['  const dependencies = dependencyNames(document.dependencies)', "  const dependencies = nameList(document.dependencies, 'dependencies')"]],
+  },
+  {
+    // The switch is the arm's own: a deployment that wants only the entry sweep
+    // must not pay a manifest read per dependency, and must not be told the arm
+    // ran when it did not.
+    name: 'composition: the installed arm ignores its own switch',
+    file: 'src/composition.ts',
+    edits: [["  if ('profile' in read && (options.installed ?? true)) {", "  if ('profile' in read) {"]],
+  },
+  {
+    // A healthy entry tree is not a healthy profile: a package installed and never
+    // selected produces no entry finding at all, so this is the only line it gets.
+    name: 'report: the terminal line does not carry the installed finding',
+    file: 'src/report.ts',
+    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''", "  if (found.length === 0 && stopped.length === 0) return ''"]],
+  },
+  {
+    // The file is what an operator reads later, and this stage's section is the
+    // only place the install path to follow is written down.
+    name: 'report: the installed section is written even with no finding',
+    file: 'src/report.ts',
+    edits: [['  const parts: string[] = []\n  if (unselected.length > 0) {', '  const parts: string[] = []\n  if (unselected.length >= 0) {']],
+  },
+  {
+    // "Nothing was missed" and "nothing could be read" are opposite answers, and
+    // the coverage caveat is what separates them.
+    name: 'report: the coverage caveat is never stated',
+    file: 'src/report.ts',
+    // A threshold rather than `if (false)`: a literal `false` makes the guarded
+    // block unreachable, which TypeScript rejects outright, so the arm would
+    // report TYPEFAIL instead of measuring the suite.
+    edits: [['  if (audit.uninspected.length > 0) {', '  if (audit.uninspected.length > 1_000_000) {']],
   },
 ]
 

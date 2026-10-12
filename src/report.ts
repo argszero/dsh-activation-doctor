@@ -29,6 +29,8 @@ import { formatError, isProblem } from './audit.ts'
 import type { EntryAudit } from './audit.ts'
 import { APP_BOOT, stoppedBundles } from './composition.ts'
 import type { CompositionAudit, StoppedBundle } from './composition.ts'
+import { unselectedPackages } from './installed.ts'
+import type { InstalledAudit, UnselectedPackage } from './installed.ts'
 
 /** The warning the shipped diagnostic puts at the top of its report. */
 export const CREDENTIAL_WARNING = 'WARNING: Raw diagnostics may contain configuration or credential values from plugin errors. Review before sharing.'
@@ -115,16 +117,108 @@ function stoppedLine(bundle: StoppedBundle, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text
 }
 
+/**
+ * One unselected package, collapsed to a line.
+ *
+ * The whole finding is "installed, never selected", so the line states what the
+ * package is and what it claims: the declaration is the reason this was reported
+ * at all, and its absence would leave the operator to guess why this package and
+ * not the twenty ordinary dependencies beside it.
+ * @param entry - an installed dependency the profile never selected.
+ * @param limit - the inclusive bound on the rendered text.
+ * @returns the terminal text for this package.
+ */
+function unselectedLine(entry: UnselectedPackage, limit: number): string {
+  const installed = entry.version === undefined ? 'installed' : `installed ${entry.version}`
+  const claims = entry.patchError !== undefined
+    ? `declares a malformed dsh.bundle.patch: ${entry.patchError}`
+    : `declares dsh.bundle.patch ${entry.patches.join(', ')}`
+  const text = `${installed} — ${claims} — absent from dsh.profile.bundles (resolved from the ${entry.from})`
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+/**
+ * The coverage caveat of one installed-selection audit, or `undefined` when it
+ * inspected everything.
+ *
+ * Reported rather than dropped: a dependency whose manifest could not be read is
+ * one this audit cannot classify, and an audit that stays quiet about its own gaps
+ * reads as coverage it does not have.
+ * @param audit - the installed-selection audit, when one was made.
+ * @returns one line, or `undefined`.
+ */
+function inspectedGap(audit: InstalledAudit | undefined): string | undefined {
+  if (audit === undefined) return undefined
+  const parts: string[] = []
+  if (audit.uninspected.length > 0) {
+    parts.push(`${String(audit.uninspected.length)} of ${String(audit.dependencies.length)} dependencies could not be inspected`)
+  }
+  if (audit.truncated > 0) parts.push(`${String(audit.truncated)} left uninspected by the audit's bound`)
+  return parts.length === 0 ? undefined : parts.join('; ')
+}
+
 /** The header line summarising one composition audit, or `undefined` without one. */
 function compositionFact(audit: CompositionAudit | undefined): string | undefined {
   if (audit === undefined) return undefined
   if (audit.declared === undefined) return `profileBundles: the declaration could not be read — ${String(audit.declaredError)}`
   const stopped = stoppedBundles(audit)
+  const unselected = unselectedPackages(audit)
   const head = `profileBundles: ${String(audit.declared.length)} declared, ${String(audit.started.length)} started`
-  return stopped.length === 0 ? head : `${head}, ${String(stopped.length)} did not start`
+  const parts = [head]
+  if (stopped.length > 0) parts.push(`${String(stopped.length)} did not start`)
+  if (unselected.length > 0) parts.push(`${String(unselected.length)} installed but never selected`)
+  const gap = inspectedGap(audit.installed)
+  if (gap !== undefined) parts.push(gap)
+  return parts.join(', ')
 }
 
-/** The composition section of the durable report, or an empty list without a finding. */
+/**
+ * The installed-but-not-selected section of the durable report, or an empty list
+ * without a finding.
+ *
+ * The `uninspected` list is rendered whenever this audit ran, including the
+ * healthy case, because it is coverage rather than a finding: an operator reading
+ * "no package is unselected" has to be able to see how many dependencies were
+ * actually inspected before that sentence means anything.
+ * @param audit - the composition audit, when one was made.
+ * @param errorChars - the inclusive bound on one rendered reason.
+ * @returns the section's lines.
+ */
+function installedSection(audit: CompositionAudit | undefined, errorChars: number): readonly string[] {
+  const installed = audit?.installed
+  if (installed === undefined) return []
+  const unselected = unselectedPackages(audit)
+  const parts: string[] = []
+  if (unselected.length > 0) {
+    parts.push('', '─'.repeat(72), 'installed but never selected', '─'.repeat(72))
+    parts.push('These packages are installed in the profile and declare a dsh.bundle, so the harness\'s own')
+    parts.push('reconcile step would have added each of them to dsh.profile.bundles. It did not run, or it did')
+    parts.push('not finish, so the package is installed and never selected: no layer, no entries, nothing in')
+    parts.push('this process and nothing for the entry sweep above to report. `dsh plugin add` is one way to')
+    parts.push('reach this state — it reconciles only after the package manager returns.')
+    for (const entry of unselected) {
+      parts.push('', entry.packageName + (entry.version === undefined ? '' : `@${entry.version}`))
+      if (entry.patchError !== undefined) parts.push(`  ${formatError(entry.patchError, errorChars)}`)
+      else parts.push(`  dsh.bundle.patch: ${entry.patches.join(', ')}`)
+      parts.push(`  resolved from the ${entry.from}; absent from dsh.profile.bundles`)
+    }
+    parts.push('')
+    parts.push('To select it without reinstalling, add the name above to dsh.profile.bundles in the profile')
+    parts.push('manifest, or re-run the install that was interrupted so reconcile runs.')
+  }
+  const gap = inspectedGap(installed)
+  if (gap !== undefined) {
+    parts.push('', `coverage: ${gap}`)
+    for (const entry of installed.uninspected) {
+      parts.push(`  ${entry.packageName}: ${formatError(entry.reason, errorChars)}`)
+    }
+  }
+  return parts
+}
+
+/**
+ * The composition section of the durable report, or an empty list without a finding.
+ */
 function compositionSection(audit: CompositionAudit | undefined, errorChars: number): readonly string[] {
   const stopped = stoppedBundles(audit)
   if (audit === undefined || stopped.length === 0) return []
@@ -168,21 +262,29 @@ export function renderSummary(
 ): string {
   const found = problems(rows, options.includePending)
   const stopped = stoppedBundles(composition)
-  // Either stage being short is a finding on its own. A profile whose bundles
-  // are all present can still have a plugin that failed, and — the case this
-  // half was added for — an entry tree that is entirely healthy can still have
-  // been composed from fewer bundles than the profile names.
-  if (found.length === 0 && stopped.length === 0) return ''
+  const unselected = unselectedPackages(composition)
+  // Any of the three being short is a finding on its own. A profile whose bundles
+  // are all present can still have a plugin that failed; an entry tree that is
+  // entirely healthy can still have been composed from fewer bundles than the
+  // profile names; and a composition that matches its own manifest exactly can
+  // still have been built from a manifest that never learned what was installed.
+  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''
   const shown = found.slice(0, options.maxEntries)
   const counts: string[] = []
   if (stopped.length > 0) {
     counts.push(`${String(stopped.length)} profile ${stopped.length === 1 ? 'bundle' : 'bundles'} did not start`)
+  }
+  if (unselected.length > 0) {
+    counts.push(`${String(unselected.length)} ${unselected.length === 1 ? 'package' : 'packages'} installed but never selected`)
   }
   if (found.length > 0) counts.push(`${String(found.length)} ${found.length === 1 ? 'entry' : 'entries'} did not activate`)
   const suffix = reportPath === undefined ? '' : ` (report: ${reportPath})`
   const lines = [`dsh: activation-doctor: ${counts.join('; ')}${suffix}`]
   for (const bundle of stopped) {
     lines.push(`  profile bundle ${bundle.packageName}: ${stoppedLine(bundle, options.summaryChars)}`)
+  }
+  for (const entry of unselected) {
+    lines.push(`  unselected ${entry.packageName}: ${unselectedLine(entry, options.summaryChars)}`)
   }
   for (const row of shown) lines.push(`  ${row.id} (${row.name}): ${firstLine(row, options.summaryChars)}`)
   const hidden = found.length - shown.length + omitted
@@ -228,6 +330,7 @@ export function renderReport(
     ? `new entries did not activate: ${String(found.length)} of ${String(total)} entries in the tree`
     : `entries did not activate: ${String(found.length)} of ${String(total)}`)
   for (const line of compositionSection(context.composition, options.errorChars)) parts.push(line)
+  for (const line of installedSection(context.composition, options.errorChars)) parts.push(line)
   parts.push('')
   parts.push('index:')
   for (const row of shown) parts.push(`  ${row.id} (${row.name}): ${headline(row, options.summaryChars)}`)

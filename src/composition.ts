@@ -25,6 +25,12 @@
  *   It is a documented file format rather than an API, so it is read directly,
  *   defensively, and absence is reported as absence rather than as an empty list.
  *
+ * One stage before that pair sits the arm in `installed.ts`: a package installed
+ * and never selected is in neither list, so the two agree and this module is
+ * structurally unable to see it. Both arms are answered from the same parse of the
+ * manifest and reported together, because the operator's question — "which of the
+ * plugins I installed is not running" — spans all three stages.
+ *
  * The **reason** for a skip is not on either surface, and that is deliberate on
  * the harness's side: `loadProfileDirectory` collects `skippedBundles` and the
  * launcher prints them once to stderr (`reportSkippedBundles`), so the only
@@ -58,6 +64,8 @@
 
 import { readFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
+import { auditInstalledSelection } from './installed.ts'
+import type { InstalledAudit } from './installed.ts'
 
 /** The package that owns profile parsing. Read only when a reason is needed. */
 export const APP_BOOT = '@deepseek-ai/dsh-app-boot'
@@ -107,6 +115,17 @@ export interface CompositionAudit {
   readonly reasons: 'dsh-app-boot' | 'unavailable'
   /** Why no reason came back, when none did. */
   readonly reasonsError: string | undefined
+  /**
+   * The stage before this one: dependencies that declare `dsh.bundle` and never
+   * entered the bundle list.
+   *
+   * `undefined` when it could not be answered — the profile manifest was unreadable,
+   * so neither list exists — and also when the operator switched the arm off. The
+   * two are distinguishable by {@link declaredError}: a read failure is already
+   * reported there, and an audit that claims nothing is not an audit that claims
+   * health.
+   */
+  readonly installed: InstalledAudit | undefined
 }
 
 /** The reader that supplies the launcher's own skip reasons. */
@@ -163,18 +182,73 @@ export function profileFactsOf(ctx: { get(name: string): unknown }): ProfileFact
 }
 
 /**
- * Read the declared bundle list from the profile manifest.
+ * The two lists a profile manifest declares about plugins.
  *
- * A missing `dsh.profile.bundles` is an empty declaration — a profile is allowed
- * to name no bundles — while an unreadable or malformed manifest is reported as
- * an error, because "declared nothing" and "could not be read" lead to opposite
- * conclusions and must not render the same.
+ * One parse feeds both stages: `bundles` is the selection this process composed
+ * its tree from, `dependencies` is what the package manager installed. Their
+ * difference is the finding the two arms report — declared-and-not-started here,
+ * installed-and-not-selected in `installed.ts`. The two fields do not even share a
+ * *shape*: `bundles` is an array of names and `dependencies` is an npm map of names
+ * to ranges, which is why each is read by its own reader.
+ */
+export interface DeclaredProfile {
+  /** Ordered bundle layer list; `undefined` when the key is absent. */
+  readonly bundles: readonly string[] | undefined
+  /** Direct dependency names, read from the map's keys; `undefined` when the key is absent. */
+  readonly dependencies: readonly string[] | undefined
+}
+
+/** Read one list of package names off a manifest object. */
+function nameList(value: unknown, field: string): { readonly names: readonly string[] } | { readonly error: string } {
+  if (value === undefined) return { names: [] }
+  if (!Array.isArray(value)) return { error: `${field} is not a list` }
+  if (value.some(name => typeof name !== 'string')) return { error: `${field} carries a non-string entry` }
+  return { names: value as readonly string[] }
+}
+
+/**
+ * Read the dependency names off a manifest object.
+ *
+ * `dependencies` is an npm **map** — `{"@acme/plugin": "^0.5.4"}` — and not the
+ * array `dsh.profile.bundles` is, which is why it has its own reader rather than
+ * sharing {@link nameList}. Reading it as a list looks harmless and is not: the
+ * parse fails, and the failure is the *whole profile's* — every shipped profile
+ * carries a `dependencies` map, so a composition audit that rejected one would
+ * report `declaredError` and lose the bundle declaration too, which is the arm that
+ * was already shipped and working. The defect survives any fixture whose manifest
+ * happens to omit the key, so the arm that caught it is the one built from a real
+ * profile manifest. `plugin-manager` reads the same field the same way
+ * (`Object.keys(manifest.dependencies ?? {})`).
+ *
+ * A list of names is accepted as well: the claim this feeds is about names either
+ * way, and refusing a spelling that states the same thing would be pedantry rather
+ * than a finding. Anything else is reported rather than read as "no dependencies".
+ * @param value - the parsed `dependencies` field.
+ * @returns the names in manifest order, or the reason there are none.
+ */
+function dependencyNames(value: unknown): { readonly names: readonly string[] } | { readonly error: string } {
+  if (value === undefined) return { names: [] }
+  if (Array.isArray(value)) {
+    if (value.some(name => typeof name !== 'string')) return { error: 'dependencies carries a non-string entry' }
+    return { names: value as readonly string[] }
+  }
+  if (value === null || typeof value !== 'object') return { error: 'dependencies is neither a map of names nor a list' }
+  return { names: Object.keys(value) }
+}
+
+/**
+ * Read the declared bundle list and dependency names from the profile manifest.
+ *
+ * A missing key is an empty declaration — a profile is allowed to name no bundles
+ * and to have no dependencies — while an unreadable or malformed manifest is
+ * reported as an error, because "declared nothing" and "could not be read" lead to
+ * opposite conclusions and must not render the same. The two fields are read by
+ * their own readers because they do not share a shape: `dsh.profile.bundles` is an
+ * array, `dependencies` an npm map.
  * @param dir - the profile directory.
  * @returns the declaration, or the reason there is none.
  */
-export async function readDeclaredBundles(
-  dir: string,
-): Promise<{ readonly bundles: readonly string[] } | { readonly error: string }> {
+export async function readDeclaredProfile(dir: string): Promise<{ readonly profile: DeclaredProfile } | { readonly error: string }> {
   let raw: string
   try {
     raw = await readFile(join(dir, 'package.json'), 'utf8')
@@ -188,11 +262,37 @@ export async function readDeclaredBundles(
     return { error: `the profile manifest is not valid JSON: ${describe(error)}` }
   }
   if (parsed === null || typeof parsed !== 'object') return { error: 'the profile manifest is not an object' }
-  const bundles = (parsed as { dsh?: { profile?: { bundles?: unknown } } }).dsh?.profile?.bundles
-  if (bundles === undefined) return { bundles: [] }
-  if (!Array.isArray(bundles)) return { error: 'dsh.profile.bundles is not a list' }
-  if (bundles.some(name => typeof name !== 'string')) return { error: 'dsh.profile.bundles carries a non-string entry' }
-  return { bundles: bundles as readonly string[] }
+  const document = parsed as { dsh?: { profile?: { bundles?: unknown } }, dependencies?: unknown }
+  const bundles = nameList(document.dsh?.profile?.bundles, 'dsh.profile.bundles')
+  if ('error' in bundles) return bundles
+  const dependencies = dependencyNames(document.dependencies)
+  if ('error' in dependencies) return dependencies
+  const carriesBundles = document.dsh?.profile?.bundles !== undefined
+  const carriesDependencies = document.dependencies !== undefined
+  return {
+    profile: {
+      bundles: carriesBundles ? bundles.names : undefined,
+      dependencies: carriesDependencies ? dependencies.names : undefined,
+    },
+  }
+}
+
+/**
+ * Read the declared bundle list from the profile manifest.
+ *
+ * A missing `dsh.profile.bundles` is an empty declaration — a profile is allowed
+ * to name no bundles — while an unreadable or malformed manifest is reported as
+ * an error, because "declared nothing" and "could not be read" lead to opposite
+ * conclusions and must not render the same.
+ * @param dir - the profile directory.
+ * @returns the declaration, or the reason there is none.
+ */
+export async function readDeclaredBundles(
+  dir: string,
+): Promise<{ readonly bundles: readonly string[] } | { readonly error: string }> {
+  const read = await readDeclaredProfile(dir)
+  if ('error' in read) return read
+  return { bundles: read.profile.bundles ?? [] }
 }
 
 /**
@@ -237,20 +337,29 @@ export async function readSkippedBundles(dir: string, installAnchor: string): Pr
  * The declaration is diffed against `startedBundles`, and the launcher's reader
  * is consulted **only when the diff is non-empty**: in the healthy case nothing
  * is imported and nothing is written, which is the case that runs on every start.
+ *
+ * The installed-selection arm runs from the same parse and is gated by
+ * `options.installed`: it resolves and reads one manifest per dependency the
+ * profile did not select, which is work a deployment that wants only the entry
+ * sweep should not pay for. It is skipped too when the manifest could not be read
+ * — there is no list to compare against, and that failure is already on
+ * `declaredError` rather than a claim of health here.
  * @param ctx - the plugin context.
  * @param readReasons - the reason reader; the seam a test drives, defaulting to
  *   {@link readSkippedBundles}.
+ * @param options - the arms to run.
  * @returns the audit, or `undefined` when this process is not a dsh profile.
  */
 export async function auditComposition(
   ctx: { get(name: string): unknown },
   readReasons: ReasonReader = readSkippedBundles,
+  options: { readonly installed?: boolean } = {},
 ): Promise<CompositionAudit | undefined> {
   const facts = profileFactsOf(ctx)
   if (facts === undefined) return undefined
 
-  const read = await readDeclaredBundles(facts.dir)
-  const declared = 'bundles' in read ? read.bundles : undefined
+  const read = await readDeclaredProfile(facts.dir)
+  const declared = 'profile' in read ? (read.profile.bundles ?? []) : undefined
   const declaredError = 'error' in read ? read.error : undefined
 
   const started = new Set(facts.startedBundles)
@@ -273,6 +382,19 @@ export async function auditComposition(
     }
   }
 
+  // Only when both lists are known: with an unreadable manifest there is nothing
+  // to compare, and reporting "no unselected packages" from an empty pair of lists
+  // would be a claim this audit is not entitled to make.
+  let installed: InstalledAudit | undefined
+  if ('profile' in read && (options.installed ?? true)) {
+    installed = await auditInstalledSelection({
+      dir: facts.dir,
+      installAnchor: facts.installAnchor,
+      dependencies: read.profile.dependencies ?? [],
+      bundles: read.profile.bundles ?? [],
+    })
+  }
+
   return {
     profile: facts.name,
     dir: facts.dir,
@@ -282,6 +404,7 @@ export async function auditComposition(
     missing: missingNames.map(packageName => ({ packageName, reason: byName.get(packageName) })),
     reasons,
     reasonsError,
+    installed,
   }
 }
 
