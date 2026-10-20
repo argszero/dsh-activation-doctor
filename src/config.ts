@@ -4,6 +4,8 @@
  * The knobs answer the two questions an operator asks about a diagnostic that
  * writes files: *where does it write* (`report`, `reportDir`) and *how much does
  * it say* (`log`, `includePending`, `maxEntries`, `errorChars`, `maxLiveReports`).
+ * The stage switches (`composition`, `installed`, `denial`) are the third
+ * question, *how much does it look at*.
  *
  * The defaults are the quiet-useful set: report to `$DSH_HOME/logs`, print one
  * line to stderr only when there is something to say, and re-report failures that
@@ -63,6 +65,18 @@ export interface Config {
    * part of the `composition` section, so `composition: false` switches it off too.
    */
   readonly installed?: boolean
+  /**
+   * Also census the entries that are switched off, and say which of them the
+   * launcher's compatibility preflight refuses rather than the operator.
+   * Defaults to `true`.
+   *
+   * A denial is `disabled: true` — the same value an operator's own decision
+   * produces — so without this arm a machine refusal and a deliberate switch-off
+   * are the same word in every report the doctor files. The arm reads at most one
+   * manifest per switched-off entry, and only when a rule is available to judge
+   * it with.
+   */
+  readonly denial?: boolean
   /** Inclusive bound on the entries listed in one report. Defaults to `50`. */
   readonly maxEntries?: number
   /** Inclusive bound on one entry's rendered error. Defaults to `4000`. */
@@ -86,6 +100,7 @@ export interface Settings {
   readonly tool: boolean
   readonly composition: boolean
   readonly installed: boolean
+  readonly denial: boolean
   readonly maxEntries: number
   readonly errorChars: number
   readonly maxLiveReports: number
@@ -104,6 +119,7 @@ export const defaultConfig: Required<Config> = {
   tool: true,
   composition: true,
   installed: true,
+  denial: true,
   maxEntries: 50,
   errorChars: 4000,
   maxLiveReports: 5,
@@ -179,6 +195,7 @@ export function normalizeConfig(config: Config): Settings {
     tool: boolean(config.tool, defaultConfig.tool),
     composition: boolean(config.composition, defaultConfig.composition),
     installed: boolean(config.installed, defaultConfig.installed),
+    denial: boolean(config.denial, defaultConfig.denial),
     maxEntries: positiveInteger(config.maxEntries, defaultConfig.maxEntries),
     errorChars: positiveInteger(config.errorChars, defaultConfig.errorChars),
     maxLiveReports: positiveInteger(config.maxLiveReports, defaultConfig.maxLiveReports),

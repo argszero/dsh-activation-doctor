@@ -90,6 +90,8 @@ import type { EntryAudit, LoaderLike } from './audit.ts'
 import { auditComposition, stoppedBundles } from './composition.ts'
 import type { CompositionAudit } from './composition.ts'
 import { unselectedPackages } from './installed.ts'
+import { censusDenials, deniedRows } from './denial.ts'
+import type { DenialCensus } from './denial.ts'
 import { defaultConfig, normalizeConfig } from './config.ts'
 import type { Config, Settings } from './config.ts'
 import { problems, renderReport, renderSummary, writeReport } from './report.ts'
@@ -115,6 +117,13 @@ export type { AnchorKind, DependencyManifest, InstalledAudit, PackageReader, Uni
 export { MAX_INSPECTED, auditInstalledSelection, inspectManifest, packageDirFor, searchPathsFor, unselectedPackages } from './installed.ts'
 export type { EntryAudit, EntryLike, FiberLike, LoaderLike, Outcome } from './audit.ts'
 export { auditEntries, classifyEntry, findingKey, formatError, isProblem, pendingTasks } from './audit.ts'
+export type {
+  CensusOptions, CompatibilityIssue, CompatibilityRule, DenialCensus, DenialCheck, DenialVerdict, RuleReader,
+  RuleSource, RuleState, VerdictContext,
+} from './denial.ts'
+export {
+  NO_NAME_REASON, UNRESOLVED_REASON, censusDenials, deniedRows, isBareSpecifier, resolveManifest, verdictOf,
+} from './denial.ts'
 export type { ReportContext, RenderOptions } from './report.ts'
 export { CREDENTIAL_WARNING, problems, renderReport, renderSummary, writeReport } from './report.ts'
 
@@ -135,6 +144,10 @@ interface DoctorState {
   composition: CompositionAudit | undefined
   /** Whether the composition audit has been attempted; it is a once-per-process fact. */
   compositionAudited: boolean
+  /** The denial census, cached for the on-demand query. */
+  census: DenialCensus | undefined
+  /** Whether the census has been attempted; the preflight runs before the tree mounts. */
+  censusAudited: boolean
 }
 
 /** Read the loader service through the reflection layer, structurally. */
@@ -212,6 +225,7 @@ function statusTool(
     settled: boolean
     reportPath: string | undefined
     composition: CompositionAudit | undefined
+    denial: DenialCensus | undefined
   }>,
   options: RenderOptions,
 ): ToolDefinition {
@@ -222,6 +236,9 @@ function statusTool(
       + 'is already taken — is unloaded whole: every tool and prompt section it contributed is gone, while the '
       + 'marketplace still shows it installed. It also reports a package that is installed and was never '
       + 'selected as a profile bundle, which is the state a failed or interrupted install leaves behind. '
+      + 'It also separates the entries that are switched off because you switched them off from the ones the '
+      + 'launcher refused while composing the profile: a refusal is written as the same `disabled` flag, and '
+      + 'its reason goes to stderr once and nowhere else. '
       + 'Use this to find out whether a plugin you expect is missing, which one it is, and why.',
     parameters: {},
     output: {
@@ -229,10 +246,11 @@ function statusTool(
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute() {
-      const { rows, settled, reportPath, composition } = await sweep()
+      const { rows, settled, reportPath, composition, denial } = await sweep()
       const found = problems(rows, options.includePending)
       const stopped = stoppedBundles(composition)
       const unselected = unselectedPackages(composition)
+      const refused = deniedRows(denial)
       const header = `activation-doctor: ${String(rows.length)} loader ${rows.length === 1 ? 'entry' : 'entries'} inspected`
         + `${settled ? '' : ' (the loader still had pending work when this ran)'}`
         + `${reportPath === undefined ? '' : `; last report: ${reportPath}`}`
@@ -240,16 +258,30 @@ function statusTool(
         // with no profile has to be able to tell "nothing was composed badly"
         // from "there was nothing to compose".
         + `${composition === undefined ? '; no profile composition to audit (this process was not launched from a dsh profile)' : ''}`
-      if (found.length === 0 && stopped.length === 0 && unselected.length === 0) {
+        + (denial === undefined
+          ? ''
+          : `; ${String(denial.inspected)} ${denial.inspected === 1 ? 'entry' : 'entries'} switched off, `
+            + `${String(refused.length)} of them refused by the launcher's preflight`
+            + `${denial.unchecked.length === 0 ? '' : `, ${String(denial.unchecked.length)} not recomputable`}`)
+      // "Or switched off deliberately" is a claim about work this arm did, and it
+      // is only earned when every switched-off row was actually cleared. With the
+      // census switched off — or with a row it could not read — some of these
+      // entries are switched off for a reason this report cannot account for, and
+      // an unearned all-clear is the failure mode this plugin exists to remove.
+      const accounted = !rows.some(row => row.outcome.kind === 'disabled')
+        || (denial !== undefined && refused.length === 0 && denial.unchecked.length === 0)
+      const allClear = accounted
+        ? 'Every entry is active (or switched off deliberately).'
+        : 'Every entry is active. At least one entry is switched off, and this report cannot say whether you did it.'
+      if (found.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) {
         // The second sentence is added only when that arm actually ran: a host
         // with no profile, or one whose manifest could not be read, has not
-        // earned the claim, and an unearned "all clear" is the failure mode this
-        // plugin exists to remove.
+        // earned the claim either.
         const selected = composition?.installed === undefined ? '' : ' Every installed bundle was selected.'
-        return `${header}\nEvery entry is active (or switched off deliberately).${selected}`
+        return `${header}\n${allClear}${selected}`
       }
-      const summary = renderSummary(rows, options, reportPath, 0, composition)
-      const healthy = found.length === 0 ? 'Every entry is active (or switched off deliberately).\n' : ''
+      const summary = renderSummary(rows, options, reportPath, 0, composition, denial)
+      const healthy = found.length === 0 && refused.length === 0 ? `${allClear}\n` : ''
       return `${header}\n\n${healthy}${summary}`
     },
   })
@@ -289,6 +321,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       started: false,
       composition: undefined,
       compositionAudited: false,
+      census: undefined,
+      censusAudited: false,
     }
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -335,6 +369,30 @@ export function apply(ctx: Context, config: Config = {}): void {
       return state.composition
     }
 
+    /**
+     * Census the switched-off entries, once per process.
+     *
+     * Once, for the same reason the composition is audited once: what was switched
+     * off is decided when the profile is composed, before the tree mounts, and the
+     * preflight keeps no copy of what the declaration said beforehand. Re-reading
+     * the tree later would attribute a *later* denial to this boot's preflight,
+     * which is a claim this arm is not entitled to make.
+     */
+    const censusOnce = async (): Promise<DenialCensus | undefined> => {
+      if (!settings.denial || state.censusAudited) return undefined
+      state.censusAudited = true
+      try {
+        const loader = loaderOf(ctx)
+        if (loader === undefined) return undefined
+        state.census = await censusDenials(ctx, loader.entries())
+      } catch {
+        // Belt and braces, like the composition: a diagnostic that throws is worse
+        // than a diagnostic that is silent.
+        state.census = undefined
+      }
+      return state.census
+    }
+
     /** Write the report and the terminal line for one sweep's fresh findings. */
     const emit = async (
       phase: 'startup' | 'live',
@@ -342,6 +400,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       settled: boolean,
       fresh: readonly EntryAudit[],
       composition: CompositionAudit | undefined,
+      census: DenialCensus | undefined,
     ): Promise<void> => {
       const now = new Date()
       let reportPath = state.lastReportPath
@@ -353,6 +412,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           version: versionOf(ctx),
           profile: profileOf() ?? composition?.profile,
           composition,
+          denial: census,
         }, options, now)
         try {
           reportPath = await writeReport(settings.reportDir, text, now)
@@ -366,7 +426,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       }
       if (settings.log === 'off') return
-      const summary = renderSummary(fresh, options, reportPath, 0, composition)
+      const summary = renderSummary(fresh, options, reportPath, 0, composition, census)
       if (summary !== '') process.stderr.write(summary)
     }
 
@@ -381,8 +441,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       // line carry one picture of the process.
       const composition = await auditOnce()
       if (disposed) return
+      const census = await censusOnce()
+      if (disposed) return
       const stopped = stoppedBundles(composition)
       const unselected = unselectedPackages(composition)
+      const refused = deniedRows(census)
       const found = problems(rows, settings.includePending)
       if (settled) {
         // A finding that has healed is forgotten, so a genuine re-failure is
@@ -396,8 +459,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       // and every remaining entry activating perfectly. Nor is a composition that
       // matches its manifest a healthy installation: the third case is a package
       // installed and never selected, where the manifest agrees with itself and
-      // the package is simply absent.
-      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0) return
+      // the package is simply absent. Nor is an entry tree with nothing failed a
+      // tree in which every switch-off was the operator's: a row the launcher's
+      // preflight refused is `disabled` too, and it is reported by no other arm.
+      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return
       for (const row of fresh) state.reported.add(findingKey(row))
       if (phase === 'live' && state.liveReports >= settings.maxLiveReports) {
         if (settings.log !== 'off') {
@@ -406,7 +471,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
         return
       }
-      await emit(phase, rows.length, settled, fresh, composition)
+      await emit(phase, rows.length, settled, fresh, composition, census)
     }
 
     /** Debounce a sweep; the tree going quiet is what ends the wait. */
@@ -450,7 +515,22 @@ export function apply(ctx: Context, config: Config = {}): void {
           const composition = state.compositionAudited
             ? state.composition
             : await auditComposition(ctx, undefined, { installed: settings.installed })
-          return { rows, settled, reportPath: state.lastReportPath, composition: settings.composition ? composition : undefined }
+          // Cached when the startup sweep ran, because a denial is a composition
+          // fact; recomputed otherwise, which is the case for a host whose first
+          // sweep is still pending when somebody asks.
+          const liveLoader = state.censusAudited ? undefined : loaderOf(ctx)
+          const census = !settings.denial
+            ? undefined
+            : state.censusAudited
+              ? state.census
+              : liveLoader === undefined ? undefined : await censusDenials(ctx, liveLoader.entries())
+          return {
+            rows,
+            settled,
+            reportPath: state.lastReportPath,
+            composition: settings.composition ? composition : undefined,
+            denial: census,
+          }
         }, options))
         return () => { dispose() }
       })

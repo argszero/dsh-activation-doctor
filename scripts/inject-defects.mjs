@@ -263,7 +263,7 @@ const MUTATIONS = [
     // of that condition exists for.
     name: 'report: a healthy entry tree suppresses the composition finding',
     file: 'src/report.ts',
-    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''", "  if (found.length === 0 && unselected.length === 0) return ''"]],
+    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return ''", "  if (found.length === 0 && unselected.length === 0 && refused.length === 0) return ''"]],
   },
   {
     // "The launcher gave no reason" is information, and a bundle rendered with an
@@ -299,12 +299,19 @@ const MUTATIONS = [
   {
     name: 'sweep: a healthy entry tree suppresses the composition finding',
     file: 'src/index.ts',
-    edits: [['      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0) return', '      if (fresh.length === 0 && unselected.length === 0) return']],
+    edits: [['      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return', '      if (fresh.length === 0 && unselected.length === 0 && refused.length === 0) return']],
   },
   {
     name: 'sweep: the on-demand query reports the composition even when it is switched off',
     file: 'src/index.ts',
-    edits: [['composition: settings.composition ? composition : undefined }', 'composition }']],
+    edits: [['composition: settings.composition ? composition : undefined,', 'composition,']],
+  },
+  {
+    // The same switch, for the same reason: an operator who turned the census off
+    // must not be told a row was refused, and must not be told one was not.
+    name: 'sweep: the on-demand query reports the census even when it is switched off',
+    file: 'src/index.ts',
+    edits: [['          const census = !settings.denial', '          const census = false']],
   },
   {
     // The qualifier, and the reason this arm is not noise. Most dependencies are
@@ -393,7 +400,7 @@ const MUTATIONS = [
     // selected produces no entry finding at all, so this is the only line it gets.
     name: 'report: the terminal line does not carry the installed finding',
     file: 'src/report.ts',
-    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''", "  if (found.length === 0 && stopped.length === 0) return ''"]],
+    edits: [["  if (found.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return ''", "  if (found.length === 0 && stopped.length === 0 && refused.length === 0) return ''"]],
   },
   {
     // The file is what an operator reads later, and this stage's section is the
@@ -411,6 +418,97 @@ const MUTATIONS = [
     // block unreachable, which TypeScript rejects outright, so the arm would
     // report TYPEFAIL instead of measuring the suite.
     edits: [['  if (audit.uninspected.length > 0) {', '  if (audit.uninspected.length > 1_000_000) {']],
+  },
+  {
+    // The row that started this arm: no `name` at all, so the launcher's manifest
+    // reader threw before it read anything and `deny()` switched the row off.
+    // Reading it as a decision puts it back where no report can see it.
+    name: 'denial: a row with no name is read as a decision',
+    file: 'src/denial.ts',
+    edits: [[
+      "  if (typeof name !== 'string' || name.trim() === '') {\n    return { kind: 'denied', reason: NO_NAME_REASON, detail: undefined }\n  }",
+      "  if (typeof name !== 'string' || name.trim() === '') {\n    return { kind: 'clear' }\n  }",
+    ]],
+  },
+  {
+    // The doctor's own words are the whole payload of that arm: the line the
+    // launcher printed names a requirement range while the row's real problem is a
+    // missing field, so quoting it back changes nothing for the operator.
+    name: "denial: the row with no name is reported in the launcher's own wording",
+    file: 'src/denial.ts',
+    edits: [['this row declares no `name`, so the compatibility preflight threw', 'the declared dsh requirements cannot be validated, so the compatibility preflight threw']],
+  },
+  {
+    // The one accessor every projection shares, so mutating it is mutating "what
+    // counts as a refusal" for the summary, the report and the query at once.
+    name: 'denial: the refused accessor always answers "nothing"',
+    file: 'src/denial.ts',
+    edits: [['  return census?.denied ?? []', '  return []']],
+  },
+  {
+    // The failure this module must not make: turning its own blind spot into a
+    // finding, which reports the audit's coverage gap as the profile's defect.
+    name: 'denial: what the census could not read is reported as a refusal',
+    file: 'src/denial.ts',
+    edits: [[
+      "    if (verdict.kind === 'denied') denied.push(check)\n    else if (verdict.kind === 'unchecked') unchecked.push(check)",
+      "    if (verdict.kind === 'denied' || verdict.kind === 'unchecked') denied.push(check)\n    else unchecked.push(check)",
+    ]],
+  },
+  {
+    // A grant the operator wrote down is the one case where the launcher's rule
+    // says "incompatible" and the profile has already answered "run it anyway".
+    name: 'denial: a granted exemption is reported as a refusal',
+    file: 'src/denial.ts',
+    edits: [["    if (issue === undefined || issue.exempted === true) return { kind: 'clear' }", "    if (issue === undefined) return { kind: 'clear' }"]],
+  },
+  {
+    // `denial()`'s own catch refuses a row whose requirements it cannot even
+    // evaluate. Admitting it instead is the plugin guessing where the launcher
+    // refused.
+    name: 'denial: a rule that cannot evaluate a manifest is admitted',
+    file: 'src/denial.ts',
+    edits: [[
+      "    return { kind: 'denied', reason: 'its declared dsh requirements cannot be validated', detail: describe(error) }",
+      "    void error\n    return { kind: 'clear' }",
+    ]],
+  },
+  {
+    // A rule nobody could reach is not a clean bill of health: the row is one the
+    // census could not classify, and answering "clear" is claiming it did.
+    name: 'denial: an unreachable compatibility rule reads as a clean bill',
+    file: 'src/denial.ts',
+    edits: [[
+      "  if (state.kind === 'unavailable') {\n    return { kind: 'unchecked', reason: `the launcher's compatibility rule could not be reached: ${state.error}` }\n  }",
+      "  if (state.kind === 'unavailable') {\n    return { kind: 'clear' }\n  }",
+    ]],
+  },
+  {
+    // The preflight reads the manifest inside its `try`, so a malformed one
+    // refuses the row exactly as a missing name does.
+    name: 'denial: a manifest that cannot be parsed is read as compatible',
+    file: 'src/denial.ts',
+    edits: [[
+      "  if (read.kind === 'unreadable') {\n    return {\n      kind: 'denied',\n      reason: 'its manifest could not be read, so the preflight refuses the row',\n      detail: read.detail,\n    }\n  }",
+      "  if (read.kind === 'unreadable') {\n    return { kind: 'clear' }\n  }",
+    ]],
+  },
+  {
+    // A healthy entry tree is not a tree in which every switch-off was the
+    // operator's, and this is the only line that gets a refusal reported at all.
+    name: 'sweep: a tree whose only problem is a refused row files no report',
+    file: 'src/index.ts',
+    edits: [['      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return', '      if (fresh.length === 0 && stopped.length === 0 && unselected.length === 0) return']],
+  },
+  {
+    // The terminal line is the half an operator actually sees, and a count with no
+    // row in it names nobody.
+    name: 'report: the terminal line does not carry the refused row',
+    file: 'src/report.ts',
+    edits: [[
+      "  for (const row of refused) {\n    lines.push(`  ${row.id} (${row.name}): disabled by the preflight \u2014 ${refusedLine(row, options.summaryChars)}`)\n  }",
+      "  for (const row of refused) {\n    void row\n  }",
+    ]],
   },
 ]
 

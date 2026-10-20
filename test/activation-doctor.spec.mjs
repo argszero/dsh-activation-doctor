@@ -311,6 +311,68 @@ describe('honesty about what it cannot do', () => {
   })
 })
 
+describe('the row the launcher switched off', () => {
+  it('is reported for what it is, and not read as a decision', async () => {
+    // The row is the reported shape: a `--patch` row with no `name` at all, which
+    // `prepareProfileEntries` refuses by setting `disabled: true` before the Loader
+    // is handed it. The loader accepts it exactly as written — measured, not
+    // assumed — so the harness reproduces the state the launcher leaves behind.
+    const w = await makeWorld({ entries: [{ id: 'no-name-row', disabled: true }] })
+    assert.ok(
+      await waitFor(() => w.stderr.text().includes('switched off by the launcher')),
+      `the refusal is named on the terminal: ${w.stderr.text()}`,
+    )
+    const said = w.stderr.text()
+    assert.match(said, /1 row switched off by the launcher's preflight/)
+    assert.match(said, /no-name-row \(\(no name\)\): disabled by the preflight/)
+    assert.match(said, /declares no `name`/)
+    // The entry sweep still classifies it as `disabled` — which is the whole
+    // reason this arm exists: on its own surface the row is a decision.
+    assert.doesNotMatch(said, /entries did not activate/, 'it is not a failed entry')
+    // And the durable file carries the mechanism, not just the row.
+    assert.ok(await waitFor(() => reports(w.home).length === 1, 4000))
+    const report = reports(w.home)[0].text
+    assert.match(report, /switchedOff: 1 entry, 1 refused by the launcher's preflight/)
+    assert.match(report, /switched off by the launcher, not by you/)
+    assert.match(report, /name\.startsWith/)
+  })
+
+  it('says nothing at all without the doctor — the control arm', async () => {
+    const w = await makeWorld({ doctor: false, entries: [{ id: 'no-name-row', disabled: true }] })
+    // The row is in the tree, switched off, exactly as the launcher left it.
+    assert.equal(w.ctx.loader.resolve('no-name-row').disabled, true)
+    assert.equal(w.stderr.text(), '', 'the loader prints nothing for a row it never imported')
+    assert.equal(existsSync(join(w.home, 'logs')), false, 'and files nothing')
+  })
+
+  it('can be switched off, and then claims nothing about a refusal', async () => {
+    const w = await makeWorld({
+      entries: [{ id: 'no-name-row', disabled: true }],
+      config: { denial: false },
+    })
+    // Turned off, it neither reports the row nor reports a clean bill for it.
+    assert.ok(await waitFor(() => reports(w.home).length === 0, 500))
+    assert.equal(w.stderr.text(), '')
+    const result = await callTool(w.ctx, 'activation_status')
+    // The doctor's own row is in the tree too, so the count is not this arm's claim.
+    assert.match(resultText(result), /^activation-doctor: \d+ loader entries inspected/u)
+    assert.doesNotMatch(resultText(result), /switched off deliberately/u, 'the arm is off, so the claim is not earned')
+    assert.doesNotMatch(resultText(result), /refused by the launcher's preflight/u, 'and turned off means it does not run')
+    assert.match(resultText(result), /cannot say whether you did it/u)
+  })
+
+  it('leaves a row that is switched off deliberately out of the report', async () => {
+    const w = await makeWorld({
+      entries: [{ id: 'deliberate', name: './fixtures/doctor.mjs', disabled: true }],
+      config: { log: 'summary' },
+    })
+    // Nothing to say: the only switched-off row is one no rule refuses and one
+    // this census could not read, and coverage alone is not a finding.
+    assert.ok(await waitFor(() => reports(w.home).length === 0, 500))
+    assert.equal(w.stderr.text(), '')
+  })
+})
+
 describe('the package itself', () => {
   it('declares itself as a mountable dsh bundle and ships the patch', async () => {
     const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))

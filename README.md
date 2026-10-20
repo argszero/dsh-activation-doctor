@@ -131,6 +131,60 @@ profile, since every shipped bundle comes from the installation rather than the
 profile. And a bundle that *is* selected but cannot be loaded is the arm above: the
 launcher reports it in `skippedBundles`.
 
+## The rows the launcher switched off
+
+The entry sweep classifies a `disabled` entry as a decision. That is wrong for
+exactly one class of row. Before the Loader is handed a profile's entry list,
+`prepareProfileEntries` runs a compatibility preflight over it and refuses a row by
+setting `disabled: true` on a clone of the list. Three consequences follow, and each
+one is why this arm exists:
+
+- **On the only surface a plugin can read, a refusal and a decision are the same
+  value.** There is no second flag, no annotation, and no record of what the
+  declaration said before the preflight touched it.
+- **The reason is one stderr line**, written at composition time, before any plugin
+  owns a logger. In the desktop build it drains into the 64 KiB buffer that is
+  attached to an error message only on *exit*, so while the application is running
+  the reason exists nowhere an operator can look.
+- **The line it does print is often misleading.** Any throw from reading the row's
+  manifest is rewritten as *"its declared dsh requirements cannot be validated"*,
+  which describes a version-range question. The case in
+  [#10203](https://github.com/deepseek-ai/deepseek-harness/discussions/10203) is a
+  `--patch` row with **no `name` field at all**: `manifestOf` opens with
+  `name.startsWith('cordis:')`, so `undefined` throws `Cannot read properties of
+  undefined (reading 'startsWith')`, the catch rewrites it, and `deny()` switches
+  the row off. The patch file looks correct, and `--dump-config` renders the patch
+  layer without ever calling the preflight, so it looks correct there too.
+
+The doctor censuses the switched-off entries and separates the two:
+
+| `switchedOff` header line | meaning |
+|---------------------------|---------|
+| `2 entries, 0 refused by the launcher's preflight; rule: the launcher's own` | both switch-offs are yours |
+| `1 entry, 1 refused by the launcher's preflight; rule: not needed` | the row no manifest could ever be read for |
+| `1 entry, 0 refused …, 1 could not be recomputed; rule: unavailable — …` | coverage, not a finding: this census could not classify the row |
+
+For a row with no `name` the verdict needs no dependency at all — the declaration
+is structurally unreadable, and the row could not mount enabled or not. Every other
+row's verdict is the launcher's own `evaluatePluginCompatibility`, run against the
+manifest the row names with the profile's `compatibility.json` exemptions applied,
+so a granted exemption is never reported as a refusal.
+
+That verdict is worded as *"the preflight refuses this row"* and not as *"the
+preflight denied this row"*, deliberately: the preflight skips a row that is already
+`disabled`, so a row you switched off by hand is never one it touched, and no
+surface is left that says which of the two happened. What the report can say is
+what the rule makes of the declaration — and for a row that is switched off *and*
+incompatible, the sentence that helps is the one saying re-enabling it will not
+work either.
+
+Two limits are stated rather than hidden. The preflight rewrites clones in place
+and keeps no copy of the original declaration, so this is **recompute-only**: it
+cannot diff the patch row against the Loader's entry. And a row whose manifest
+cannot be resolved from the same anchors the Loader uses is listed as **coverage**,
+never as "the operator did it" — an audit that cannot answer must not answer
+"healthy".
+
 ## Install
 
 **In the application (the Desktop shell, and the Web UI).** Desktop's profile is
@@ -224,6 +278,10 @@ else:
   stages above agree on, because a package that never entered
   `dsh.profile.bundles` is missing from each list they read. See
   [the stage before the composition](#the-stage-before-the-composition).
+- **Separates "you switched it off" from "the launcher refused it".** A denial is
+  `disabled: true`, the same value your own decision produces, and its reason is
+  one stderr line written before any plugin could read it. See
+  [the rows the launcher switched off](#the-rows-the-launcher-switched-off).
 
 ## Configuration
 
@@ -236,6 +294,7 @@ else:
 | `includePending` | `true` | list entries waiting for a service |
 | `composition` | `true` | audit the profile's declared bundles against what this process started from |
 | `installed` | `true` | report installed dependencies that declare a bundle and were never selected |
+| `denial` | `true` | separate the entries the launcher's preflight refused from the ones you switched off |
 | `watch` | `true` | re-report failures that appear after the first sweep |
 | `tool` | `true` | register the `activation_status` tool |
 | `maxEntries` | `50` | inclusive bound on the entries listed |
@@ -266,7 +325,12 @@ admitted across the release lines.
   `apps/desktop/src/host-process.ts`; a plugin can write more to stderr, not
   redirect what is already there. The report file is the answer to that.
 - **It is not a policy change.** Registration semantics, the marketplace row and
-  the startup-audit required-id set are all untouched.
+  the startup-audit required-id set are all untouched. Switching a denied row back
+  on does not make it run: the report says so, and changes nothing.
+- **It cannot tell a denied row from an identical row you switched off.** The
+  preflight rewrites clones in place and keeps no copy of the original declaration,
+  so the census recomputes the launcher's verdict from what the entry still carries
+  and cannot diff it against the patch row that produced it.
 - **It does not re-import a module to explain an `import-failed` entry.** The
   obvious way to recover that reason is to import the entry's specifier again and
   catch the throw — but that re-executes third-party module code inside the

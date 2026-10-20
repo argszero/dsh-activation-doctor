@@ -29,6 +29,8 @@ import { formatError, isProblem } from './audit.ts'
 import type { EntryAudit } from './audit.ts'
 import { APP_BOOT, stoppedBundles } from './composition.ts'
 import type { CompositionAudit, StoppedBundle } from './composition.ts'
+import { deniedRows } from './denial.ts'
+import type { DenialCensus, DenialCheck } from './denial.ts'
 import { unselectedPackages } from './installed.ts'
 import type { InstalledAudit, UnselectedPackage } from './installed.ts'
 
@@ -59,6 +61,15 @@ export interface ReportContext {
    * to audit, and the report says so by not making a claim about one.
    */
   readonly composition?: CompositionAudit | undefined
+  /**
+   * The denial census, when entries were switched off and the arm ran.
+   *
+   * Absent is two facts at once — nothing was switched off, or the operator
+   * switched the arm off — and the header says which by saying nothing either
+   * way: a report that never inspected a denial must not read as a report that
+   * found none.
+   */
+  readonly denial?: DenialCensus | undefined
 }
 
 /** Rendering bounds shared by every projection of one sweep. */
@@ -173,6 +184,89 @@ function compositionFact(audit: CompositionAudit | undefined): string | undefine
 }
 
 /**
+ * One refused row, collapsed to a line.
+ *
+ * The reason is the launcher's own, or the doctor's plain sentence for the row
+ * that has no name at all; `detail` carries whatever text the launcher swallowed
+ * so a reader can match it against the line they may have scrolled past.
+ * @param row - a switched-off entry the launcher refuses.
+ * @param limit - the inclusive bound on the rendered text.
+ * @returns the terminal text for this row.
+ */
+function refusedLine(row: DenialCheck, limit: number): string {
+  const reason = row.verdict.kind === 'denied' ? row.verdict.reason : ''
+  const detail = row.verdict.kind === 'denied' && row.verdict.detail !== undefined ? ` (${row.verdict.detail})` : ''
+  const text = `${reason}${detail}`.replace(/\s+/g, ' ').trim()
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+/**
+ * The header line summarising one census, or `undefined` without one.
+ *
+ * Coverage is stated whenever the arm ran, including the healthy case: an
+ * operator reading "no switched-off row was refused" has to be able to see how
+ * many rows were actually recomputed before that sentence means anything.
+ * @param census - the census, when one was made.
+ * @returns one line, or `undefined`.
+ */
+function denialFact(census: DenialCensus | undefined): string | undefined {
+  if (census === undefined) return undefined
+  const refused = deniedRows(census)
+  const parts = [`switchedOff: ${String(census.inspected)} ${census.inspected === 1 ? 'entry' : 'entries'}`]
+  parts.push(`${String(refused.length)} refused by the launcher\'s preflight`)
+  if (census.unchecked.length > 0) parts.push(`${String(census.unchecked.length)} could not be recomputed`)
+  const rule = census.rule === 'dsh-app-boot'
+    ? 'rule: the launcher\'s own'
+    : census.rule === 'not-needed' ? 'rule: not needed' : `rule: unavailable — ${String(census.ruleError)}`
+  return `${parts.join(', ')}; ${rule}`
+}
+
+/**
+ * The denial section of the durable report, or an empty list without a finding.
+ *
+ * The paragraph explains the mechanism rather than the symptom, because the
+ * symptom is the whole problem: a row the launcher refused looks exactly like a
+ * row the operator switched off, and the one line that named the reason went to
+ * stderr before any plugin owned a logger.
+ * @param census - the denial census, when one was made.
+ * @param errorChars - the inclusive bound on one rendered reason.
+ * @returns the section's lines.
+ */
+function denialSection(census: DenialCensus | undefined, errorChars: number): readonly string[] {
+  const refused = deniedRows(census)
+  const parts: string[] = []
+  if (refused.length > 0) {
+    parts.push('', '─'.repeat(72), 'switched off by the launcher, not by you', '─'.repeat(72))
+    parts.push('`prepareProfileEntries` refuses a row by setting `disabled: true` on it before the')
+    parts.push('Loader is ever handed the entry list, and the only record of why is one line it')
+    parts.push('wrote to stderr at composition time — before any plugin owns a logger, and into')
+    parts.push('the buffer the desktop shell attaches to an exit error. The rows below are')
+    parts.push('`disabled` and the launcher\'s own rule refuses their declaration, so switching')
+    parts.push('them back on will not make them run. Where the reason is a row with no `name` at')
+    parts.push('all, note that `manifestOf` opens with `name.startsWith(\'cordis:\')`: the row threw')
+    parts.push('before a manifest was ever read, and `--dump-config` renders the patch layer')
+    parts.push('without calling the preflight, so the row looks correct in the dump.')
+    for (const row of refused) {
+      parts.push('', `${row.id} (${row.name})`)
+      if (row.verdict.kind !== 'denied') continue
+      parts.push(`  ${row.verdict.reason}`)
+      if (row.verdict.detail !== undefined) parts.push(`  ${formatError(row.verdict.detail, errorChars)}`)
+    }
+  }
+  if (census !== undefined && census.unchecked.length > 0) {
+    parts.push('', `coverage: ${String(census.unchecked.length)} of ${String(census.inspected)} switched-off rows could not be recomputed`)
+    if (census.rule !== 'dsh-app-boot' && census.ruleError !== undefined) {
+      parts.push(`  the compatibility rule: ${formatError(census.ruleError, errorChars)}`)
+    }
+    for (const row of census.unchecked) {
+      parts.push(`  ${row.id} (${row.name}): ${row.verdict.kind === 'unchecked' ? row.verdict.reason : ''}`)
+    }
+    parts.push('  None of these is a finding: a row this census cannot read is a row it cannot classify.')
+  }
+  return parts
+}
+
+/**
  * The installed-but-not-selected section of the durable report, or an empty list
  * without a finding.
  *
@@ -251,6 +345,7 @@ function compositionSection(audit: CompositionAudit | undefined, errorChars: num
  * @param reportPath - the durable report, when one was written.
  * @param omitted - entries dropped by `maxEntries`.
  * @param composition - the profile composition audit, when this process is a dsh profile.
+ * @param denial - the denial census, when entries were switched off.
  * @returns the text to write to stderr, or `''` when there is nothing to say.
  */
 export function renderSummary(
@@ -259,16 +354,20 @@ export function renderSummary(
   reportPath?: string | undefined,
   omitted = 0,
   composition?: CompositionAudit | undefined,
+  denial?: DenialCensus | undefined,
 ): string {
   const found = problems(rows, options.includePending)
   const stopped = stoppedBundles(composition)
   const unselected = unselectedPackages(composition)
-  // Any of the three being short is a finding on its own. A profile whose bundles
+  const refused = deniedRows(denial)
+  // Any of the four being short is a finding on its own. A profile whose bundles
   // are all present can still have a plugin that failed; an entry tree that is
   // entirely healthy can still have been composed from fewer bundles than the
-  // profile names; and a composition that matches its own manifest exactly can
-  // still have been built from a manifest that never learned what was installed.
-  if (found.length === 0 && stopped.length === 0 && unselected.length === 0) return ''
+  // profile names; a composition that matches its own manifest exactly can still
+  // have been built from a manifest that never learned what was installed; and an
+  // entry tree in which nothing failed can still hold a row the launcher switched
+  // off, which every other arm reads as a decision.
+  if (found.length === 0 && stopped.length === 0 && unselected.length === 0 && refused.length === 0) return ''
   const shown = found.slice(0, options.maxEntries)
   const counts: string[] = []
   if (stopped.length > 0) {
@@ -276,6 +375,9 @@ export function renderSummary(
   }
   if (unselected.length > 0) {
     counts.push(`${String(unselected.length)} ${unselected.length === 1 ? 'package' : 'packages'} installed but never selected`)
+  }
+  if (refused.length > 0) {
+    counts.push(`${String(refused.length)} ${refused.length === 1 ? 'row' : 'rows'} switched off by the launcher's preflight`)
   }
   if (found.length > 0) counts.push(`${String(found.length)} ${found.length === 1 ? 'entry' : 'entries'} did not activate`)
   const suffix = reportPath === undefined ? '' : ` (report: ${reportPath})`
@@ -285,6 +387,9 @@ export function renderSummary(
   }
   for (const entry of unselected) {
     lines.push(`  unselected ${entry.packageName}: ${unselectedLine(entry, options.summaryChars)}`)
+  }
+  for (const row of refused) {
+    lines.push(`  ${row.id} (${row.name}): disabled by the preflight — ${refusedLine(row, options.summaryChars)}`)
   }
   for (const row of shown) lines.push(`  ${row.id} (${row.name}): ${firstLine(row, options.summaryChars)}`)
   const hidden = found.length - shown.length + omitted
@@ -322,6 +427,8 @@ export function renderReport(
   if (context.profile !== undefined) parts.push(`profile: ${context.profile}`)
   const compositionFactLine = compositionFact(context.composition)
   if (compositionFactLine !== undefined) parts.push(compositionFactLine)
+  const denialFactLine = denialFact(context.denial)
+  if (denialFactLine !== undefined) parts.push(denialFactLine)
   parts.push(`nodeVersion: ${process.version}`)
   parts.push(`platform: ${process.platform} ${process.arch}`)
   parts.push(`execPath: ${process.execPath}`)
@@ -331,6 +438,7 @@ export function renderReport(
     : `entries did not activate: ${String(found.length)} of ${String(total)}`)
   for (const line of compositionSection(context.composition, options.errorChars)) parts.push(line)
   for (const line of installedSection(context.composition, options.errorChars)) parts.push(line)
+  for (const line of denialSection(context.denial, options.errorChars)) parts.push(line)
   parts.push('')
   parts.push('index:')
   for (const row of shown) parts.push(`  ${row.id} (${row.name}): ${headline(row, options.summaryChars)}`)
