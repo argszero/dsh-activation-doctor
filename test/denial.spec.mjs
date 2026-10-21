@@ -194,7 +194,7 @@ describe('a refusal the launcher reaches through the compatibility rule', () => 
     })
     const [row] = deniedRows(census)
     assert.equal(row.verdict.kind, 'denied')
-    assert.match(row.verdict.detail, /broken-plugin\/package\.json/u)
+    assert.match(row.verdict.detail, /broken-plugin[\\/]package\.json/u)
     assert.equal(read, 0, 'a manifest that cannot be parsed needs no rule')
   })
 })

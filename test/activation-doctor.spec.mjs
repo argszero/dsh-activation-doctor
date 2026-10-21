@@ -101,8 +101,13 @@ describe('the durable report', () => {
     const [report] = reports(w.home)
     const dir = statSync(join(w.home, 'logs'))
     const file = statSync(report.path)
-    assert.equal(dir.mode & 0o777, 0o700, 'the log directory is private')
-    assert.equal(file.mode & 0o777, 0o600, 'the report is private')
+    // `mkdir`/`writeFile` take a POSIX permission bitmask; Node ignores it on Windows,
+    // where access is decided by the inherited NTFS ACL instead. The privacy contract
+    // therefore only has a subject on POSIX, and README states that limit.
+    if (process.platform !== 'win32') {
+      assert.equal(dir.mode & 0o777, 0o700, 'the log directory is private')
+      assert.equal(file.mode & 0o777, 0o600, 'the report is private')
+    }
     assert.match(report.text, /^WARNING: Raw diagnostics may contain configuration or credential values/)
     assert.match(report.text, /phase: startup/)
     assert.match(report.text, /settled: yes/)
@@ -409,7 +414,9 @@ describe('the package itself', () => {
         await waitFor(() => existsSync(join(root, 'fresh-logs')) && w.stderr.text().includes('activation-doctor:')),
         'the directory is created on demand and the finding is printed',
       )
-      assert.equal(statSync(join(root, 'fresh-logs')).mode & 0o777, 0o700)
+      if (process.platform !== 'win32') {
+        assert.equal(statSync(join(root, 'fresh-logs')).mode & 0o777, 0o700)
+      }
       assert.match(w.stderr.text(), /activation-doctor: 1 entry did not activate/)
     } finally {
       rmSync(root, { recursive: true, force: true })

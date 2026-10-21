@@ -250,7 +250,10 @@ else:
 
 - **Files a private report.** `<home>/logs/activation-<timestamp>-<uuid>.log`,
   directory mode `0700`, file mode `0600`, created with `wx` so an existing path
-  is an error rather than an overwrite. `<home>` is `$DSH_HOME` when it is set to
+  is an error rather than an overwrite. **Those modes are POSIX only**: Windows has
+  no permission bits, Node drops the `mode` argument there, and access is decided by
+  whatever ACL the log directory inherits. On Windows the `wx` exclusivity still
+  holds, but "private" is not something this plugin establishes or can assert. `<home>` is `$DSH_HOME` when it is set to
   a non-blank value, and `~/.dsh` otherwise — the same directory the harness's own
   startup report uses. The first line warns that raw diagnostics may contain
   configuration or credential values.

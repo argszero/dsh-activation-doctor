@@ -23,7 +23,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { after, describe, it } from 'node:test'
 import { collideEntry, waitFor, world } from './harness.mjs'
 
@@ -89,7 +89,7 @@ describe('reading the launcher\'s facts', () => {
 
   it('falls back to the directory\'s own name when the launcher named no profile', () => {
     const given = facts({ name: '' })
-    assert.equal(profileFactsOf(ctxWith(given)).name, given.dir.split('/').pop())
+    assert.equal(profileFactsOf(ctxWith(given)).name, basename(given.dir))
   })
 
   it('answers "not a profile" for a plain cordis application', () => {
