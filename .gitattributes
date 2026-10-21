@@ -1,0 +1,5 @@
+# Every checkout gets LF. The mutation harness matches multi-line source anchors
+# written with `\n`, so a CRLF working tree (Git for Windows defaults
+# `core.autocrlf` to true) would leave those arms unapplied and the harness would
+# report them as NO-OP instead of testing them.
+* text=auto eol=lf

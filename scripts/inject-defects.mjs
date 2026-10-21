@@ -9,6 +9,12 @@
  * mutation that does not compile is reported separately as TYPEFAIL, because it
  * never reached the suite either.
  *
+ * Two outcomes exist so a platform difference is never read as a hole in the
+ * suite. Anchors are compared with line endings normalized, because a CRLF
+ * checkout would otherwise leave every multi-line anchor unmatched and report it
+ * as NO-OP. An arm marked `posixOnly` reports POSIX-ONLY on Windows rather than
+ * SILENT: the assertion it removes has no Windows subject to begin with.
+ *
  * Every arm is a defect this plugin could plausibly have shipped: one distinction
  * it exists to make, removed one line at a time. The distinctions were chosen
  * from the plugin's own promises — the classification, the settle-first rule, the
@@ -151,11 +157,15 @@ const MUTATIONS = [
     // The directory and the file are private because they hold raw errors.
     name: 'report: the report directory is world-readable',
     file: 'src/report.ts',
+    // Node drops a `mode` argument on Windows, so the suite asserts the mode on
+    // POSIX only and this mutation has no Windows subject.
+    posixOnly: true,
     edits: [['  await mkdir(dir, { recursive: true, mode: 0o700 })', '  await mkdir(dir, { recursive: true, mode: 0o755 })']],
   },
   {
     name: 'report: the report file is world-readable',
     file: 'src/report.ts',
+    posixOnly: true,
     edits: [["  await writeFile(path, text, { flag: 'wx', mode: 0o600 })", "  await writeFile(path, text, { flag: 'w', mode: 0o644 })"]],
   },
   {
@@ -513,6 +523,9 @@ const MUTATIONS = [
 ]
 
 const argv = process.argv.slice(2)
+/** Compare anchors and sources with one line-ending convention. */
+const lf = text => text.replaceAll('\r\n', '\n')
+
 const filter = argv.find(argument => argument.startsWith('--filter='))?.slice('--filter='.length)
 
 /**
@@ -551,17 +564,23 @@ for (const mutation of MUTATIONS) {
   if (filter !== undefined && !mutation.name.includes(filter)) continue
   const path = resolve(ROOT, mutation.file)
   const original = readFileSync(path, 'utf8')
-  let mutated = original
+  // `lf()` on both sides: a CRLF checkout must not turn an arm into a silent NO-OP.
+  let mutated = lf(original)
   let applied = true
   for (const [from, to] of mutation.edits) {
-    if (!mutated.includes(from)) {
+    const anchor = lf(from)
+    if (!mutated.includes(anchor)) {
       applied = false
       break
     }
-    mutated = mutated.replace(from, to)
+    mutated = mutated.replace(anchor, lf(to))
+  }
+  if (mutation.posixOnly === true && process.platform === 'win32') {
+    results.push({ name: mutation.name, outcome: 'POSIX-ONLY', detail: 'the assertion this arm removes is POSIX-only, so Windows has no subject for the mutation' })
+    continue
   }
   if (!applied) {
-    results.push({ name: mutation.name, outcome: 'NO-OP', detail: 'the source no longer contains the text this arm mutates' })
+    results.push({ name: mutation.name, outcome: 'NO-OP', detail: 'the source no longer contains the text this arm mutates (compared with line endings normalized)' })
     continue
   }
   try {
@@ -593,7 +612,8 @@ const caught = results.filter(result => result.outcome === 'CAUGHT').length
 const declared = new Set(MUTATIONS.filter(mutation => mutation.equivalent !== undefined).map(mutation => mutation.name))
 const equivalents = results.filter(result => result.outcome === 'SILENT' && declared.has(result.name))
 const silent = results.filter(result => result.outcome === 'SILENT' && !declared.has(result.name))
-const other = results.filter(result => result.outcome !== 'CAUGHT' && result.outcome !== 'SILENT')
+const posixOnly = results.filter(result => result.outcome === 'POSIX-ONLY')
+const other = results.filter(result => result.outcome !== 'CAUGHT' && result.outcome !== 'SILENT' && result.outcome !== 'POSIX-ONLY')
 
 for (const result of results) {
   const label = result.outcome === 'SILENT' && declared.has(result.name) ? 'EQUIVALENT' : result.outcome
@@ -603,6 +623,9 @@ process.stdout.write(`\n${caught}/${results.length} caught`)
 process.stdout.write(silent.length === 0
   ? ` — no arm is silent (${equivalents.length} declared equivalent — see the arms)\n`
   : `, ${silent.length} SILENT\n`)
+if (posixOnly.length > 0) {
+  process.stdout.write(`${posixOnly.length} arm(s) not applicable on this platform: ${posixOnly.map(result => result.name).join(', ')}\n`)
+}
 if (other.length > 0) {
   process.stdout.write(`${other.length} arm(s) could not be evaluated: ${other.map(result => `${result.outcome} ${result.name}`).join(', ')}\n`)
 }
