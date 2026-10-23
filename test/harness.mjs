@@ -68,6 +68,14 @@ export async function world(spec = {}) {
   const stderr = captureStderr()
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
+  // `$DSH_HOME` is not the only input to a report path: a blank or absent override
+  // falls through `homedir()` to the real profile, and the mutation arm that
+  // disables `DSH_HOME` makes exactly that state reachable mid-run. Shadow both
+  // spellings of the home directory for the world's lifetime, so a fixture cannot
+  // be written into the developer's own home on either platform.
+  const previousUserHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  process.env.HOME = home
+  process.env.USERPROFILE = home
 
   const ctx = new Context()
   // The launcher's service, provided the way app-boot provides it — as a plain
@@ -142,6 +150,10 @@ export async function world(spec = {}) {
       stderr.restore()
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome
+      for (const [name, value] of Object.entries(previousUserHome)) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
       rmSync(home, { recursive: true, force: true })
     },
   }
